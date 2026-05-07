@@ -18,7 +18,8 @@ import argparse
 import os
 import sys
 import time
-from typing import Dict, List, Optional, Tuple
+from collections import deque
+from typing import Deque, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -127,20 +128,49 @@ class LiveCoverageRecorder:
 
         # 校准状态
         self._calibrated = False
+        self._calib_buffer: Deque[Dict[int, Tuple[float, float]]] = deque(maxlen=config.calib_frames)
         self._lost_consecutive: int = 0
         self._hud_text: List[str] = []
 
     def calibrate(self, frame: np.ndarray) -> bool:
-        """从当前帧检测角点 ArUco 并计算单应矩阵。"""
+        """从当前帧检测角点 ArUco 并累积标定缓冲区。
+
+        需要连续 calib_frames 帧全部检测到 4 角，然后取平均坐标计算单应矩阵。
+        这样即使单帧抖动，最终单应矩阵也是稳定的。
+
+        Returns:
+            True 表示标定完成（此后不再需要调用此方法）
+        """
         corners = detect_corner_markers(frame, self.config)
         if corners is None:
+            self._calib_buffer.clear()  # 丢失一帧就清空缓冲，强制连续稳定
             return False
 
-        img_pts = [corners[cid] for cid in self.config.corner_ids]
+        self._calib_buffer.append(corners)
+
+        if len(self._calib_buffer) < self.config.calib_frames:
+            return False  # 缓冲未满
+
+        # 取平均
+        avg_corners: Dict[int, Tuple[float, float]] = {}
+        for cid in self.config.corner_ids:
+            xs = [self._calib_buffer[i][cid][0] for i in range(len(self._calib_buffer))]
+            ys = [self._calib_buffer[i][cid][1] for i in range(len(self._calib_buffer))]
+            avg_corners[cid] = (float(np.mean(xs)), float(np.mean(ys)))
+
+        img_pts = [avg_corners[cid] for cid in self.config.corner_ids]
         paper_pts = list(self.config.corner_paper_xy)
         self._homography = compute_homography(img_pts, paper_pts)
-        print(f"✓ 单应矩阵标定成功")
+
+        for cid in self.config.corner_ids:
+            std_x = float(np.std([self._calib_buffer[i][cid][0] for i in range(len(self._calib_buffer))]))
+            std_y = float(np.std([self._calib_buffer[i][cid][1] for i in range(len(self._calib_buffer))]))
+            print(f"  ✓ 角点 ID={cid}: avg=({avg_corners[cid][0]:.1f},"
+                  f"{avg_corners[cid][1]:.1f})  std=({std_x:.2f},{std_y:.2f})px")
+
+        print(f"✓ 单应矩阵标定成功 (基于 {self.config.calib_frames} 帧平均)")
         self._calibrated = True
+        self._calib_buffer.clear()  # 释放内存
         return True
 
     def init_grid(self, mask_img: np.ndarray):
@@ -289,7 +319,7 @@ def live_coverage(config: CameraCoverageConfig,
     aruco_params = cv2.aruco.DetectorParameters()
     aruco_detector = cv2.aruco.ArucoDetector(aruco_dict, aruco_params)
 
-    print("等待 ArUco 角点标定 (ID=0,1,2,3)... 按 'q' 退出")
+    print(f"等待 ArUco 角点稳定标定 (ID=0,1,2,3, 需连续 {config.calib_frames} 帧)... 按 'q' 退出")
     calibration_attempts = 0
     frame_idx = 0
     t_start = time.time()
@@ -317,7 +347,9 @@ def live_coverage(config: CameraCoverageConfig,
 
             # 显示标定状态
             disp = _resize_to_screen(frame)
-            cv2.putText(disp, f"CALIBRATING... ({calibration_attempts})",
+            buf_len = len(recorder._calib_buffer) if hasattr(recorder, '_calib_buffer') else 0
+            total = recorder.config.calib_frames
+            cv2.putText(disp, f"CALIBRATING [{buf_len}/{total}]  (attempt {calibration_attempts})",
                         (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
             cv2.imshow("Live Coverage — 按 'q' 退出", disp)
         else:
@@ -433,6 +465,8 @@ def main():
                         help="网格分辨率 m (默认: 0.005)")
     parser.add_argument("--robot-id", type=int, default=4,
                         help="车顶 ArUco ID (默认: 4)")
+    parser.add_argument("--calib-frames", type=int, default=30,
+                        help="标定稳定帧数，越大越抗抖动但需等越久 (默认: 30)")
 
     # 离线分析参数（--record 模式下可选）
     parser.add_argument("--analyze", action="store_true",
@@ -476,6 +510,7 @@ def main():
                 coverage_radius=args.coverage_radius,
                 resolution=args.resolution,
                 robot_id=args.robot_id,
+                calib_frames=args.calib_frames,
             )
             analyzer = CameraCoverageAnalyzer(config)
             try:
@@ -507,6 +542,7 @@ def main():
             coverage_radius=args.coverage_radius,
             resolution=args.resolution,
             robot_id=args.robot_id,
+            calib_frames=args.calib_frames,
         )
         live_coverage(
             config=config,

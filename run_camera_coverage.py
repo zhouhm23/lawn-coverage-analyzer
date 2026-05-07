@@ -50,6 +50,8 @@ def main():
                         help="结束帧 (默认: -1 = 到结尾)")
     parser.add_argument("--frame-skip", type=int, default=1,
                         help="处理帧间隔，默认每帧处理")
+    parser.add_argument("--calib-frames", type=int, default=30,
+                        help="标定稳定帧数，越大越抗抖动 (默认: 30)")
     parser.add_argument("--coverage-radius", type=float, default=0.12,
                         help="覆盖半径 m (默认: 0.12)")
     parser.add_argument("--resolution", type=float, default=0.005,
@@ -72,6 +74,7 @@ def main():
         resolution=args.resolution,
         frame_skip=args.frame_skip,
         robot_id=args.robot_id,
+        calib_frames=args.calib_frames,
     )
 
     # 执行分析

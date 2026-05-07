@@ -65,6 +65,9 @@ class CameraCoverageConfig:
     # ArUco 丢失容忍（连续丢失此帧数后报 warning）
     max_lost_frames: int = 5
 
+    # 标定稳定性参数
+    calib_frames: int = 30          # 标定采样帧数（约 1 秒 @30fps），取平均消除抖动
+
     # 蒙版参数
     mask_threshold: int = 128          # 0-255，蒙版二值化阈值
 
@@ -469,16 +472,17 @@ class CameraCoverageAnalyzer:
         print(f"      帧率: {cfg.video_fps:.1f} fps")
 
         # 3. 首帧检测 ArUco 角点 → 计算单应矩阵
-        print(f"[3/5] 检测 ArUco 标记并计算单应矩阵...")
+        print(f"[3/5] 检测 ArUco 标记并计算单应矩阵 (稳定采样 {cfg.calib_frames} 帧)...")
         ret, first_frame = cap.read()
         if not ret:
             raise RuntimeError("无法读取视频首帧")
 
-        # 重置到开头
+        # 重置到开头，传入 cap 以支持多帧扫描
         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        self._homography = self._calibrate_homography(first_frame, cap)
 
-        self._homography = self._calibrate_homography(first_frame)
-        print(f"      单应矩阵:\n{self._homography}")
+        # 标定完成后重置到开头，重新追踪
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
         # 4. 蒙版 → 可通行网格
         print(f"[4/5] 蒙版映射到论文坐标网格 ({cfg.grid_w}×{cfg.grid_h}, "
@@ -514,25 +518,99 @@ class CameraCoverageAnalyzer:
 
     # ── 单应标定 ──────────────────────────────────────────────────────
 
-    def _calibrate_homography(self, frame: np.ndarray) -> np.ndarray:
-        """从首帧检测角点 ArUco 并计算单应矩阵。"""
-        corners = detect_corner_markers(frame, self.config)
+    def _calibrate_homography(self, frame: np.ndarray,
+                              cap: Optional[cv2.VideoCapture] = None) -> np.ndarray:
+        """从视频帧中稳定检测角点 ArUco 并计算单应矩阵。
+
+        策略：
+        1. 如果首帧全检测到 → 直接用（快速路径）
+        2. 否则前向/后向扫描最多 calib_frames*3 帧，找到稳定周期
+        3. 对最近 calib_frames 帧的角点坐标取平均，消除抖动
+        """
+        cfg = self.config
+
+        # 快速路径：首帧就全检测到，且 calib_frames=1，直接出
+        if cfg.calib_frames <= 1:
+            return self._calibrate_homography_once(frame)
+
+        # 扫描视频找角点
+        if cap is None:
+            # 无视频流可用（单张图片），回退单帧
+            return self._calibrate_homography_once(frame)
+
+        print(f"      扫描视频寻找稳定角点 (需要连续 {cfg.calib_frames} 帧)...")
+        frame_positions: Dict[int, List[Tuple[float, float]]] = {
+            cid: [] for cid in cfg.corner_ids}
+        scanned = 0
+        max_scan = cfg.calib_frames * 3
+
+        while scanned < max_scan:
+            ret, fr = cap.read()
+            if not ret:
+                break
+            scanned += 1
+
+            # 同时检测角点 (不依赖 ArUco 是否标注在 frame 上)
+            corners = detect_corner_markers(fr, cfg)
+            if corners is not None:
+                for cid in cfg.corner_ids:
+                    frame_positions[cid].append(corners[cid])
+                if len(frame_positions[cfg.corner_ids[0]]) >= cfg.calib_frames:
+                    break  # 收集够了
+            else:
+                # 丢失了一帧，重置计数（但我们保留历史用最近 N 帧）
+                pass
+
+            if scanned % 30 == 0:
+                print(f"      ... 已扫描 {scanned} 帧")
+
+        # 取最近 calib_frames 帧的平均
+        for cid in cfg.corner_ids:
+            if len(frame_positions[cid]) < max(cfg.calib_frames // 2, 1):
+                raise RuntimeError(
+                    f"未能在 {max_scan} 帧内稳定检测到 4 个角点 "
+                    f"(IDs={list(cfg.corner_ids)})。"
+                    f" 请检查 ArUco 标记是否完整入画且清晰可见。"
+                    f" 或降低 --calib-frames。")
+            # 只保留最近 N 帧
+            frame_positions[cid] = frame_positions[cid][-cfg.calib_frames:]
+
+        # 计算平均坐标
+        avg_corners: Dict[int, Tuple[float, float]] = {}
+        for cid in cfg.corner_ids:
+            pts = frame_positions[cid]
+            avg_corners[cid] = (
+                float(np.mean([p[0] for p in pts])),
+                float(np.mean([p[1] for p in pts])),
+            )
+            std_x = float(np.std([p[0] for p in pts]))
+            std_y = float(np.std([p[1] for p in pts]))
+            print(f"      角点 ID={cid}: 平均 ({avg_corners[cid][0]:.1f}, "
+                  f"{avg_corners[cid][1]:.1f})  "
+                  f"std=({std_x:.2f}, {std_y:.2f})px  "
+                  f"样本={len(pts)}帧")
+
+        img_pts = [avg_corners[cid] for cid in cfg.corner_ids]
+        paper_pts = list(cfg.corner_paper_xy)
+        H = compute_homography(img_pts, paper_pts)
+        print(f"      单应矩阵 (基于 {cfg.calib_frames} 帧平均):\n{H}")
+        return H
+
+    def _calibrate_homography_once(self, frame: np.ndarray) -> np.ndarray:
+        """单帧标定（回退路径）。"""
+        cfg = self.config
+        corners = detect_corner_markers(frame, cfg)
         if corners is None:
             raise RuntimeError(
-                f"首帧未检测到全部 {len(self.config.corner_ids)} 个角点 ArUco "
-                f"(IDs={list(self.config.corner_ids)})。"
+                f"首帧未检测到全部 {len(cfg.corner_ids)} 个角点 ArUco "
+                f"(IDs={list(cfg.corner_ids)})。"
                 f" 请检查 ArUco 标记是否完整入画且清晰可见。")
 
-        img_pts = []
-        paper_pts = []
-        for i, cid in enumerate(self.config.corner_ids):
-            img_pts.append(corners[cid])
-            paper_pts.append(self.config.corner_paper_xy[i])
+        img_pts = [corners[cid] for cid in cfg.corner_ids]
+        paper_pts = list(cfg.corner_paper_xy)
+        for i, cid in enumerate(cfg.corner_ids):
             print(f"      角点 ID={cid}: 图像 {corners[cid]} → "
-                  f"论文 {self.config.corner_paper_xy[i]}")
-
-        # 检查：确保检测到的 ID 和 config 中的顺序一致
-        # ArUco 检测返回的坐标顺序由 detectMarkers 决定，我们需要按 config.corner_ids 排序
+                  f"论文 {cfg.corner_paper_xy[i]}")
         return compute_homography(img_pts, paper_pts)
 
     # ── 轨迹追踪 ──────────────────────────────────────────────────────

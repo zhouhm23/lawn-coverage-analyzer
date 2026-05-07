@@ -32,6 +32,9 @@ python record_camera.py --live --color-lower 35,50,50 --color-upper 85,255,255
 
 操作：摆好摄像头 → 角点 ArUco 自动标定 → 启动割草机 → 右下角实时看覆盖率 → 按 q 退出。
 
+> 如果角点检测闪烁，画面会显示 `CALIBRATING [N/30]` 进度条。标定需要连续 30 帧稳定检测到 4 角。
+> 可用 `--calib-frames 15` 减少等待，或用 `--calib-frames 60` 更稳定。
+
 ### 3. 离线分析（先录后算）
 
 ```bash
@@ -43,6 +46,7 @@ python run_camera_coverage.py --video demo.mp4 --mask mask.png --visualize
 
 ```bash
 python test_aruco.py --image test.png
+python test_aruco.py --camera
 ```
 
 ## 文件说明
