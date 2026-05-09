@@ -66,10 +66,13 @@ class CameraCoverageConfig:
     max_lost_frames: int = 5
 
     # 标定稳定性参数
-    calib_frames: int = 30          # 标定采样帧数（约 1 秒 @30fps），取平均消除抖动
+    calib_frames: int = 3         # 标定采样帧数（约 1 秒 @30fps），取平均消除抖动
 
     # 蒙版参数
     mask_threshold: int = 128          # 0-255，蒙版二值化阈值
+
+    # 最小移动距离阈值 (m)，低于此距离的移动视为静止抖动，不计入轨迹长度
+    min_movement: float = 0.01         # 1cm，参考车速 0.26m/s @30fps ≈ 8.7mm/帧
 
     @property
     def grid_w(self) -> int:
@@ -295,27 +298,36 @@ def accumulate_coverage(trajectory: List[Tuple[float, float, float]],
 
 def compute_metrics(covered_count: np.ndarray,
                     passable_mask: np.ndarray,
-                    trajectory_len: float) -> Dict[str, float]:
+                    trajectory_len: float,
+                    coverage_radius: float = 0.12,
+                    resolution: float = 0.005) -> Dict[str, float]:
     """从覆盖计数和可通行蒙版计算四项指标。
+
+    重复覆盖率定义（条带面积法）:
+        割草宽度 = 2 × coverage_radius
+        总条带面积 = 轨迹长度 × 割草宽度
+        唯一覆盖面积 = 覆盖格数 × resolution²
+        R = max(0, (总条带面积 - 唯一覆盖面积) / 总条带面积) × 100%
+
+        即：车体扫过的总面积中，有多少是"重复碾压已覆盖区域"。
+        车原地转弯时：条带面积增加但唯一覆盖面积不变 → R 上升 ✓
+        车直线前进时：条带面积 ≈ 唯一覆盖面积 → R 接近 0 ✓
 
     Args:
         covered_count: (H, W) int: 每格覆盖次数
         passable_mask: (H, W) bool: 可通行区域
         trajectory_len: 轨迹总长度 (m)
+        coverage_radius: 覆盖半径 (m)
+        resolution: 网格分辨率 (m)
 
     Returns:
         {
             "area_coverage": 区域覆盖率,
-            "repeat_coverage": 重复覆盖率 (重叠计数>2的正覆盖像素/总正覆盖像素),
-            "coverage_efficiency": 覆盖效率 (覆盖率/轨迹长度),
+            "repeat_coverage": 重复覆盖率,
+            "coverage_efficiency": 覆盖效率,
             "total_passable_cells": 可通行总格数,
             "trajectory_length_m": 轨迹长度,
         }
-
-    重复覆盖率定义:
-        R = N_re / N_total × 100%
-        N_re:   重叠计数值 > 2 的正覆盖像素总和
-        N_total: 覆盖计数 > 0 的正覆盖像素总和
     """
     total_passable = int(np.sum(passable_mask))
     if total_passable == 0:
@@ -331,8 +343,15 @@ def compute_metrics(covered_count: np.ndarray,
     N_total = int(np.sum(covered_mask))
     area_cov = N_total / total_passable
 
-    N_re = int(np.sum((covered_count > 2) & passable_mask))
-    repeat_cov = (N_re / N_total) if N_total > 0 else 0.0
+    # ── 条带面积法：重复 = (扫过的总面积 - 唯一覆盖面积) / 扫过的总面积
+    coverage_width = 2.0 * coverage_radius           # 割草宽度 (m)
+    total_stroke_area = trajectory_len * coverage_width  # 条带总面积 (m²)
+    unique_covered_area = N_total * (resolution ** 2)    # 唯一覆盖面积 (m²)
+
+    if total_stroke_area > 1e-9:
+        repeat_cov = max(0.0, (total_stroke_area - unique_covered_area) / total_stroke_area)
+    else:
+        repeat_cov = 0.0
 
     efficiency = area_cov / max(trajectory_len, 0.001)
 
@@ -348,7 +367,7 @@ def compute_metrics(covered_count: np.ndarray,
 def compute_time_series(trajectory: List[Tuple[float, float, float]],
                         passable_mask: np.ndarray,
                         config: CameraCoverageConfig) -> List[Tuple[float, float, float]]:
-    """计算覆盖率-时间曲线。
+    """计算覆盖率-时间曲线（条带面积法）。
 
     Returns:
         [(t_sec, area_coverage, repeat_coverage), ...]
@@ -357,6 +376,9 @@ def compute_time_series(trajectory: List[Tuple[float, float, float]],
     rad_cells = int(math.ceil(config.coverage_radius / config.resolution))
     total_passable = max(int(np.sum(passable_mask)), 1)
     series = []
+    traj_len_so_far = 0.0
+    prev_pt = None
+    coverage_width = 2.0 * config.coverage_radius
 
     for idx, (t, px, py) in enumerate(trajectory):
         cx = int(px / config.resolution)
@@ -372,21 +394,28 @@ def compute_time_series(trajectory: List[Tuple[float, float, float]],
             circle = (X - px) ** 2 + (Y - py) ** 2 <= (config.coverage_radius ** 2)
             covered_count[y0:y1, x0:x1] += circle.astype(np.int32)
 
+        # 累计轨迹长度（带 min_movement 过滤）
+        if prev_pt is not None:
+            d = math.hypot(px - prev_pt[0], py - prev_pt[1])
+            if d >= config.min_movement:
+                traj_len_so_far += d
+        prev_pt = (px, py)
+
         if (idx + 1) % config.time_series_interval == 0:
-            covered_mask = (covered_count > 0) & passable_mask
-            N_total = int(np.sum(covered_mask))
-            N_re = int(np.sum((covered_count > 2) & passable_mask))
-            series.append((t, N_total / total_passable,
-                           (N_re / N_total) if N_total > 0 else 0.0))
+            N_total = int(np.sum((covered_count > 0) & passable_mask))
+            unique_area = N_total * (config.resolution ** 2)
+            stroke_area = traj_len_so_far * coverage_width
+            rep = max(0.0, (stroke_area - unique_area) / stroke_area) if stroke_area > 1e-9 else 0.0
+            series.append((t, N_total / total_passable, rep))
 
     # 保证最后一帧也记录
     if len(trajectory) > 0 and (len(trajectory) % config.time_series_interval != 0):
         t = trajectory[-1][0]
-        covered_mask = (covered_count > 0) & passable_mask
-        N_total = int(np.sum(covered_mask))
-        N_re = int(np.sum((covered_count > 2) & passable_mask))
-        series.append((t, N_total / total_passable,
-                       (N_re / N_total) if N_total > 0 else 0.0))
+        N_total = int(np.sum((covered_count > 0) & passable_mask))
+        unique_area = N_total * (config.resolution ** 2)
+        stroke_area = traj_len_so_far * coverage_width
+        rep = max(0.0, (stroke_area - unique_area) / stroke_area) if stroke_area > 1e-9 else 0.0
+        series.append((t, N_total / total_passable, rep))
 
     return series
 
@@ -395,13 +424,21 @@ def compute_time_series(trajectory: List[Tuple[float, float, float]],
 # 轨迹工具
 # ═══════════════════════════════════════════════════════════════════════════
 
-def compute_trajectory_length(trajectory: List[Tuple[float, float, float]]) -> float:
-    """计算轨迹总长度 (m)。"""
+def compute_trajectory_length(trajectory: List[Tuple[float, float, float]],
+                              min_movement: float = 0.01) -> float:
+    """计算轨迹总长度 (m)，过滤低于 min_movement 的微小抖动。
+
+    Args:
+        trajectory: [(t, x_paper, y_paper), ...]
+        min_movement: 最小移动距离阈值 (m)，低于此值视为静止抖动
+    """
     total = 0.0
     for i in range(1, len(trajectory)):
         _, x1, y1 = trajectory[i - 1]
         _, x2, y2 = trajectory[i]
-        total += math.hypot(x2 - x1, y2 - y1)
+        d = math.hypot(x2 - x1, y2 - y1)
+        if d >= min_movement:
+            total += d
     return total
 
 
@@ -514,11 +551,12 @@ class CameraCoverageAnalyzer:
 
         # 6. 计算覆盖
         print("计算覆盖网格与指标...")
-        traj_len = compute_trajectory_length(self._trajectory)
+        traj_len = compute_trajectory_length(self._trajectory, cfg.min_movement)
         self._covered_count = accumulate_coverage(
             self._trajectory, self._passable_mask, cfg)
         self._metrics = compute_metrics(
-            self._covered_count, self._passable_mask, traj_len)
+            self._covered_count, self._passable_mask, traj_len,
+            cfg.coverage_radius, cfg.resolution)
         self._time_series = compute_time_series(
             self._trajectory, self._passable_mask, cfg)
 
@@ -533,7 +571,7 @@ class CameraCoverageAnalyzer:
 
         策略：
         1. 如果首帧全检测到 → 直接用（快速路径）
-        2. 否则前向/后向扫描最多 calib_frames*3 帧，找到稳定周期
+        2. 否则扫描最多 300 帧（10 秒 @30fps），找到 calib_frames 帧全检测
         3. 对最近 calib_frames 帧的角点坐标取平均，消除抖动
         """
         cfg = self.config
@@ -547,11 +585,11 @@ class CameraCoverageAnalyzer:
             # 无视频流可用（单张图片），回退单帧
             return self._calibrate_homography_once(frame)
 
-        print(f"      扫描视频寻找稳定角点 (需要连续 {cfg.calib_frames} 帧)...")
+        print(f"      扫描视频寻找稳定角点 (需要 {cfg.calib_frames} 帧全检测到 4 角)...")
         frame_positions: Dict[int, List[Tuple[float, float]]] = {
             cid: [] for cid in cfg.corner_ids}
         scanned = 0
-        max_scan = cfg.calib_frames * 3
+        max_scan = max(cfg.calib_frames * 10, 300)  # 至少扫描 300 帧 (10 秒)
 
         while scanned < max_scan:
             ret, fr = cap.read()
@@ -848,7 +886,7 @@ class CameraCoverageAnalyzer:
 
         ax.plot(ts_list, area_list, 'g-', linewidth=1.5, label='Area Coverage')
         ax.plot(ts_list, repeat_list, 'orange', linewidth=1.5,
-                label='Repeat Coverage (>2x)')
+                label='Repeat Coverage (stroke-area method)')
         ax.set_xlabel("Time (s)")
         ax.set_ylabel("Coverage (%)")
         ax.set_title("Coverage vs Time")

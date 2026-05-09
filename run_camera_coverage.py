@@ -16,21 +16,14 @@ import argparse
 import sys
 import os
 
-# ── 智能导入：优先 ROS2 包路径，回退到同目录独立文件 ────────────────────
-try:
-    from coverage_evaluator.camera_coverage import (
-        CameraCoverageAnalyzer,
-        CameraCoverageConfig,
-    )
-except ImportError:
-    # 独立运行：从同目录导入 camera_coverage.py
-    _script_dir = os.path.dirname(os.path.abspath(__file__))
-    if _script_dir not in sys.path:
-        sys.path.insert(0, _script_dir)
-    from camera_coverage import (  # type: ignore
-        CameraCoverageAnalyzer,
-        CameraCoverageConfig,
-    )
+# 独立运行：从同目录导入 camera_coverage.py
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+if _script_dir not in sys.path:
+    sys.path.insert(0, _script_dir)
+from camera_coverage import (  # type: ignore
+    CameraCoverageAnalyzer,
+    CameraCoverageConfig,
+)
 
 
 def main():
@@ -50,14 +43,16 @@ def main():
                         help="结束帧 (默认: -1 = 到结尾)")
     parser.add_argument("--frame-skip", type=int, default=1,
                         help="处理帧间隔，默认每帧处理")
-    parser.add_argument("--calib-frames", type=int, default=30,
-                        help="标定稳定帧数，越大越抗抖动 (默认: 30)")
+    parser.add_argument("--calib-frames", type=int, default=3,
+                        help="标定稳定帧数，越大越抗抖动 (默认: 3)")
     parser.add_argument("--coverage-radius", type=float, default=0.12,
                         help="覆盖半径 m (默认: 0.12)")
     parser.add_argument("--resolution", type=float, default=0.005,
                         help="网格分辨率 m (默认: 0.005)")
     parser.add_argument("--robot-id", type=int, default=4,
                         help="车顶 ArUco ID (默认: 4)")
+    parser.add_argument("--min-movement", type=float, default=0.01,
+                        help="最小移动距离阈值 m，低于此值视为静止抖动 (默认: 0.01)")
     args = parser.parse_args()
 
     # 检查文件存在
@@ -75,6 +70,7 @@ def main():
         frame_skip=args.frame_skip,
         robot_id=args.robot_id,
         calib_frames=args.calib_frames,
+        min_movement=args.min_movement,
     )
 
     # 执行分析

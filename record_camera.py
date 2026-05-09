@@ -305,20 +305,26 @@ class LiveCoverageRecorder:
 
         self._trajectory_points += 1
         if self._last_pt is not None:
-            self._trajectory_len += np.hypot(px - self._last_pt[0],
-                                             py - self._last_pt[1])
+            d = np.hypot(px - self._last_pt[0], py - self._last_pt[1])
+            if d >= cfg.min_movement:
+                self._trajectory_len += d
         self._last_pt = paper_pt
 
-        # ── 计算实时指标（修正重复覆盖率公式）────────────────────
-        # R = N_re / N_total × 100%
-        #   N_re: 重叠计数 > 2 的正覆盖像素
-        #   N_total: 覆盖计数 > 0 的正覆盖像素（即已覆盖区域）
+        # ── 计算实时指标（条带面积法）────────────────────────────
+        # 重复覆盖率 = (轨迹扫过的条带总面积 - 唯一覆盖面积) / 条带总面积
+        # 车直行时条带≈唯一面积 → 低重复；原地转弯时条带增加但唯一面积不变 → 高重复
         if self._total_passable > 0:
-            covered_mask = (self._covered_count > 0) & self._passable_mask
-            N_total = int(np.sum(covered_mask))
-            N_re = int(np.sum((self._covered_count > 2) & self._passable_mask))
+            N_total = int(np.sum((self._covered_count > 0) & self._passable_mask))
             area_cov = N_total / self._total_passable
-            rep_cov = (N_re / N_total) if N_total > 0 else 0.0
+
+            coverage_width = 2.0 * cfg.coverage_radius
+            total_stroke = self._trajectory_len * coverage_width
+            unique_area = N_total * (cfg.resolution ** 2)
+            if total_stroke > 1e-9:
+                rep_cov = max(0.0, (total_stroke - unique_area) / total_stroke)
+            else:
+                rep_cov = 0.0
+
             eff = area_cov / max(self._trajectory_len, 0.01)
         else:
             area_cov = rep_cov = eff = 0.0
@@ -443,6 +449,8 @@ def live_coverage(config: CameraCoverageConfig,
                 print("开始实时覆盖分析...")
 
             # 显示标定状态
+            if writer is not None:
+                writer.write(frame.copy())
             disp = _resize_to_screen(frame)
             buf_len = len(recorder._calib_buffer) if hasattr(recorder, '_calib_buffer') else 0
             total = recorder.config.calib_frames
@@ -465,16 +473,16 @@ def live_coverage(config: CameraCoverageConfig,
             # 更新覆盖
             recorder.update(t_sec, robot_pt)
 
+            # ── 录制原始帧（在标注前，保留给离线分析）──────────
+            if writer is not None:
+                writer.write(frame.copy())
+
             # 画 ArUco 标注
             if ids is not None:
                 cv2.aruco.drawDetectedMarkers(frame, corners, ids)
 
-            # 绘制 HUD
+            # 绘制 HUD（仅在显示画面上叠加）
             frame = recorder.draw_hud(frame)
-
-            # 录制
-            if writer is not None:
-                writer.write(frame)
 
             # 显示
             disp = _resize_to_screen(frame)
@@ -509,12 +517,18 @@ def _print_live_summary(recorder: LiveCoverageRecorder, elapsed: float,
     print(f"  总帧数:       {total_frames}")
     print(f"  有效轨迹点:   {recorder._trajectory_points}")
     if recorder._total_passable > 0:
-        covered_mask = (recorder._covered_count > 0) & recorder._passable_mask
-        N_total = int(np.sum(covered_mask))
-        N_re = int(np.sum((recorder._covered_count > 2) & recorder._passable_mask))
+        cfg = recorder.config
+        N_total = int(np.sum((recorder._covered_count > 0) & recorder._passable_mask))
+        coverage_width = 2.0 * cfg.coverage_radius
+        total_stroke = recorder._trajectory_len * coverage_width
+        unique_area = N_total * (cfg.resolution ** 2)
+        if total_stroke > 1e-9:
+            rep_cov = max(0.0, (total_stroke - unique_area) / total_stroke)
+        else:
+            rep_cov = 0.0
         print(f"  区域覆盖率:   {N_total/recorder._total_passable*100:.1f}%")
-        print(f"  重复覆盖率:   {(N_re/N_total*100) if N_total>0 else 0:.1f}%  "
-              f"(N_re={N_re}, N_total={N_total}, >2次重叠)")
+        print(f"  重复覆盖率:   {rep_cov*100:.1f}%  "
+              f"(条带={total_stroke:.3f}m², 唯一覆盖={unique_area:.3f}m²)")
         print(f"  轨迹长度:     {recorder._trajectory_len:.2f} m")
     print(f"{'='*50}")
 
@@ -570,10 +584,12 @@ def main():
                         help="网格分辨率 m (默认: 0.005)")
     parser.add_argument("--robot-id", type=int, default=4,
                         help="车顶 ArUco ID (默认: 4)")
-    parser.add_argument("--calib-frames", type=int, default=30,
-                        help="标定稳定帧数，越大越抗抖动但需等越久 (默认: 30)")
+    parser.add_argument("--calib-frames", type=int, default=3,
+                        help="标定稳定帧数，越大越抗抖动但需等越久 (默认: 3)")
     parser.add_argument("--interpolate", action="store_true",
                         help="ArUco 短暂丢失时线性插值连接轨迹")
+    parser.add_argument("--min-movement", type=float, default=0.01,
+                        help="最小移动距离阈值 m，低于此值视为静止抖动 (默认: 0.01)")
 
     # 离线分析参数（--record 模式下可选）
     parser.add_argument("--analyze", action="store_true",
@@ -618,6 +634,7 @@ def main():
                 resolution=args.resolution,
                 robot_id=args.robot_id,
                 calib_frames=args.calib_frames,
+                min_movement=args.min_movement,
             )
             analyzer = CameraCoverageAnalyzer(config)
             try:
@@ -650,6 +667,7 @@ def main():
             resolution=args.resolution,
             robot_id=args.robot_id,
             calib_frames=args.calib_frames,
+            min_movement=args.min_movement,
         )
         live_coverage(
             config=config,
