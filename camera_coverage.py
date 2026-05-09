@@ -306,11 +306,16 @@ def compute_metrics(covered_count: np.ndarray,
     Returns:
         {
             "area_coverage": 区域覆盖率,
-            "repeat_coverage": 重复覆盖率 (被覆盖≥2次的占比),
+            "repeat_coverage": 重复覆盖率 (重叠计数>2的正覆盖像素/总正覆盖像素),
             "coverage_efficiency": 覆盖效率 (覆盖率/轨迹长度),
             "total_passable_cells": 可通行总格数,
             "trajectory_length_m": 轨迹长度,
         }
+
+    重复覆盖率定义:
+        R = N_re / N_total × 100%
+        N_re:   重叠计数值 > 2 的正覆盖像素总和
+        N_total: 覆盖计数 > 0 的正覆盖像素总和
     """
     total_passable = int(np.sum(passable_mask))
     if total_passable == 0:
@@ -322,12 +327,12 @@ def compute_metrics(covered_count: np.ndarray,
             "trajectory_length_m": trajectory_len,
         }
 
-    covered = (covered_count > 0) & passable_mask
-    covered_passable = int(np.sum(covered))
-    area_cov = covered_passable / total_passable
+    covered_mask = (covered_count > 0) & passable_mask
+    N_total = int(np.sum(covered_mask))
+    area_cov = N_total / total_passable
 
-    repeat_covered = (covered_count >= 2) & passable_mask
-    repeat_cov = int(np.sum(repeat_covered)) / total_passable
+    N_re = int(np.sum((covered_count > 2) & passable_mask))
+    repeat_cov = (N_re / N_total) if N_total > 0 else 0.0
 
     efficiency = area_cov / max(trajectory_len, 0.001)
 
@@ -368,16 +373,20 @@ def compute_time_series(trajectory: List[Tuple[float, float, float]],
             covered_count[y0:y1, x0:x1] += circle.astype(np.int32)
 
         if (idx + 1) % config.time_series_interval == 0:
-            cov = int(np.sum((covered_count > 0) & passable_mask))
-            rep = int(np.sum((covered_count >= 2) & passable_mask))
-            series.append((t, cov / total_passable, rep / total_passable))
+            covered_mask = (covered_count > 0) & passable_mask
+            N_total = int(np.sum(covered_mask))
+            N_re = int(np.sum((covered_count > 2) & passable_mask))
+            series.append((t, N_total / total_passable,
+                           (N_re / N_total) if N_total > 0 else 0.0))
 
     # 保证最后一帧也记录
     if len(trajectory) > 0 and (len(trajectory) % config.time_series_interval != 0):
         t = trajectory[-1][0]
-        cov = int(np.sum((covered_count > 0) & passable_mask))
-        rep = int(np.sum((covered_count >= 2) & passable_mask))
-        series.append((t, cov / total_passable, rep / total_passable))
+        covered_mask = (covered_count > 0) & passable_mask
+        N_total = int(np.sum(covered_mask))
+        N_re = int(np.sum((covered_count > 2) & passable_mask))
+        series.append((t, N_total / total_passable,
+                       (N_re / N_total) if N_total > 0 else 0.0))
 
     return series
 
@@ -839,7 +848,7 @@ class CameraCoverageAnalyzer:
 
         ax.plot(ts_list, area_list, 'g-', linewidth=1.5, label='Area Coverage')
         ax.plot(ts_list, repeat_list, 'orange', linewidth=1.5,
-                label='Repeat Coverage (≥2×)')
+                label='Repeat Coverage (>2x)')
         ax.set_xlabel("Time (s)")
         ax.set_ylabel("Coverage (%)")
         ax.set_title("Coverage vs Time")

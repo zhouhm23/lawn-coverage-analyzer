@@ -24,6 +24,62 @@ from typing import Deque, Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
+# ── PIL 用于中文渲染 ────────────────────────────────────────────────
+try:
+    from PIL import Image, ImageDraw, ImageFont
+    _HAS_PIL = True
+except ImportError:
+    _HAS_PIL = False
+
+# ── 中文字体查找 ────────────────────────────────────────────────────
+_CHINESE_FONT = None
+if _HAS_PIL:
+    _FONT_CANDIDATES = [
+        "C:/Windows/Fonts/simhei.ttf",       # 黑体
+        "C:/Windows/Fonts/msyh.ttc",          # 微软雅黑
+        "C:/Windows/Fonts/simsun.ttc",        # 宋体
+        "C:/Windows/Fonts/simkai.ttf",        # 楷体
+        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",  # Linux
+        "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+        "/System/Library/Fonts/PingFang.ttc",  # macOS
+    ]
+    for _fp in _FONT_CANDIDATES:
+        if os.path.exists(_fp):
+            _CHINESE_FONT = _fp
+            break
+
+
+def _put_chinese_text(img: np.ndarray, text: str, pos: tuple,
+                      font_size: int = 20, color: tuple = (0, 255, 0),
+                      thickness: int = 2) -> np.ndarray:
+    """在 OpenCV 图像上绘制中文文本（PIL 回退）。
+
+    如果 PIL 不可用或没有中文字体，回退到 cv2.putText（仅英文/数字）。
+    """
+    if not _HAS_PIL or _CHINESE_FONT is None:
+        # 回退：只显示 ASCII 字符
+        ascii_text = ''.join(c if ord(c) < 128 else '?' for c in text)
+        cv2.putText(img, ascii_text, pos, cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6, color, thickness)
+        return img
+
+    try:
+        font = ImageFont.truetype(_CHINESE_FONT, font_size)
+        # BGR → RGB → PIL
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(img_rgb)
+        draw = ImageDraw.Draw(pil_img)
+        # PIL 颜色是 RGB 元组
+        pil_color = (color[2], color[1], color[0])
+        draw.text(pos, text, font=font, fill=pil_color)
+        # 转回 BGR
+        img[:] = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+    except Exception:
+        ascii_text = ''.join(c if ord(c) < 128 else '?' for c in text)
+        cv2.putText(img, ascii_text, pos, cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6, color, thickness)
+    return img
+
 # ── 导入 camera_coverage 核心模块 ────────────────────────────────────
 _script_dir = os.path.dirname(os.path.abspath(__file__))
 if _script_dir not in sys.path:
@@ -115,8 +171,9 @@ def record_only(output_path: str, camera_index: int = CAMERA_INDEX):
 class LiveCoverageRecorder:
     """实时录制并在画面右下角叠加覆盖率信息。"""
 
-    def __init__(self, config: CameraCoverageConfig):
+    def __init__(self, config: CameraCoverageConfig, interpolate: bool = False):
         self.config = config
+        self.interpolate = interpolate  # ArUco 丢失时是否线性插值
         self._homography: Optional[np.ndarray] = None
         self._passable_mask: Optional[np.ndarray] = None
         self._covered_count: Optional[np.ndarray] = None
@@ -125,6 +182,15 @@ class LiveCoverageRecorder:
         self._trajectory_len: float = 0.0
         self._last_pt: Optional[Tuple[float, float]] = None
         self._rad_cells: int = 0
+
+        # 工作计时器：从首次检测到机器人开始计时
+        self._work_start_time: Optional[float] = None
+        self._work_elapsed: float = 0.0
+
+        # ArUco 插值状态
+        self._last_valid_pt: Optional[Tuple[float, float]] = None
+        self._lost_frames_count: int = 0
+        self._max_interp_frames: int = 5  # 最多插值帧数
 
         # 校准状态
         self._calibrated = False
@@ -185,14 +251,35 @@ class LiveCoverageRecorder:
               f"(≈ {self._total_passable * cfg.resolution**2:.3f} m²)")
 
     def update(self, t_sec: float, robot_pt: Optional[Tuple[float, float]]):
-        """用当前帧的机器人位置更新覆盖。"""
-        if robot_pt is None:
+        """用当前帧的机器人位置更新覆盖。
+
+        支持 ArUco 丢失时线性插值（如果 self.interpolate=True）。
+        """
+        # ── 插值路径：ArUco 丢失但启用插值 ─────────────────────────
+        if robot_pt is None and self.interpolate and self._last_valid_pt is not None:
+            self._lost_frames_count += 1
+            if self._lost_frames_count <= self._max_interp_frames:
+                # 复用上一个有效位置（零阶保持）
+                robot_pt = self._last_valid_pt
+            else:
+                self._lost_consecutive += 1
+                self._hud_text = ["⚠ ArUco 丢失 (插值超限)"]
+                return
+        elif robot_pt is None:
             self._lost_consecutive += 1
             self._hud_text = ["⚠ ArUco 丢失"]
             return
+        else:
+            self._lost_frames_count = 0
 
         self._lost_consecutive = 0
+
+        # ── 工作计时器：首次检测到机器人时启动 ────────────────────
+        if self._work_start_time is None:
+            self._work_start_time = t_sec
+
         paper_pt = image_to_paper(robot_pt, self._homography)
+        self._last_valid_pt = robot_pt
         cfg = self.config
 
         # 范围检查
@@ -222,15 +309,22 @@ class LiveCoverageRecorder:
                                              py - self._last_pt[1])
         self._last_pt = paper_pt
 
-        # 计算实时指标
+        # ── 计算实时指标（修正重复覆盖率公式）────────────────────
+        # R = N_re / N_total × 100%
+        #   N_re: 重叠计数 > 2 的正覆盖像素
+        #   N_total: 覆盖计数 > 0 的正覆盖像素（即已覆盖区域）
         if self._total_passable > 0:
-            cov = int(np.sum((self._covered_count > 0) & self._passable_mask))
-            rep = int(np.sum((self._covered_count >= 2) & self._passable_mask))
-            area_cov = cov / self._total_passable
-            rep_cov = rep / self._total_passable
+            covered_mask = (self._covered_count > 0) & self._passable_mask
+            N_total = int(np.sum(covered_mask))
+            N_re = int(np.sum((self._covered_count > 2) & self._passable_mask))
+            area_cov = N_total / self._total_passable
+            rep_cov = (N_re / N_total) if N_total > 0 else 0.0
             eff = area_cov / max(self._trajectory_len, 0.01)
         else:
             area_cov = rep_cov = eff = 0.0
+
+        # 工作时间
+        work_sec = t_sec - (self._work_start_time or t_sec)
 
         self._hud_text = [
             f"区域覆盖率: {area_cov*100:5.1f}%",
@@ -238,13 +332,15 @@ class LiveCoverageRecorder:
             f"覆盖效率:   {eff:.3f} m-1",
             f"轨迹长度:   {self._trajectory_len:.2f} m",
             f"轨迹点数:   {self._trajectory_points}",
-            f"时间:       {t_sec:.1f} s",
+            f"工作时间:   {work_sec:.1f} s",
         ]
+        if self.interpolate and self._lost_frames_count > 0:
+            self._hud_text.append(f"插值续接:   {self._lost_frames_count} 帧")
 
     def draw_hud(self, frame: np.ndarray) -> np.ndarray:
-        """在画面上叠加 HUD 文本面板。"""
+        """在画面上叠加 HUD 文本面板（支持中文）。"""
         overlay = frame.copy()
-        panel_w, panel_h = 320, 20 + len(self._hud_text) * 28
+        panel_w, panel_h = 340, 20 + len(self._hud_text) * 28
         margin = 20
         x0 = frame.shape[1] - panel_w - margin
         y0 = frame.shape[0] - panel_h - margin
@@ -254,10 +350,10 @@ class LiveCoverageRecorder:
                       (x0 + panel_w, y0 + panel_h), (0, 0, 0), -1)
         cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
 
-        # 文本
+        # 中文文本
         for i, txt in enumerate(self._hud_text):
-            cv2.putText(frame, txt, (x0 + 12, y0 + 28 + i * 28),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            _put_chinese_text(frame, txt, (x0 + 12, y0 + 16 + i * 28),
+                              font_size=18, color=(0, 255, 0), thickness=2)
 
         # 状态指示
         status = "CALIBRATED" if self._calibrated else "NO CALIB"
@@ -273,7 +369,8 @@ def live_coverage(config: CameraCoverageConfig,
                   output_video: Optional[str] = None,
                   mask_path: Optional[str] = None,
                   color_lower: Optional[Tuple[int, int, int]] = None,
-                  color_upper: Optional[Tuple[int, int, int]] = None):
+                  color_upper: Optional[Tuple[int, int, int]] = None,
+                  interpolate: bool = False):
     """边录制边显示覆盖率。
 
     蒙版优先级: mask_path > color_range > 全矩形可通行
@@ -313,7 +410,7 @@ def live_coverage(config: CameraCoverageConfig,
 
     # 3. 初始化实时覆盖记录器
     print(f"[3/3] 实时覆盖模式启动...")
-    recorder = LiveCoverageRecorder(config)
+    recorder = LiveCoverageRecorder(config, interpolate=interpolate)
 
     aruco_dict = cv2.aruco.getPredefinedDictionary(config.aruco_dict)
     aruco_params = cv2.aruco.DetectorParameters()
@@ -349,8 +446,9 @@ def live_coverage(config: CameraCoverageConfig,
             disp = _resize_to_screen(frame)
             buf_len = len(recorder._calib_buffer) if hasattr(recorder, '_calib_buffer') else 0
             total = recorder.config.calib_frames
-            cv2.putText(disp, f"CALIBRATING [{buf_len}/{total}]  (attempt {calibration_attempts})",
-                        (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+            _put_chinese_text(disp,
+                f"CALIBRATING [{buf_len}/{total}]  (attempt {calibration_attempts})",
+                (20, 20), font_size=22, color=(0, 255, 255), thickness=2)
             cv2.imshow("Live Coverage — 按 'q' 退出", disp)
         else:
             # 检测机器人 ArUco
@@ -399,17 +497,24 @@ def live_coverage(config: CameraCoverageConfig,
 def _print_live_summary(recorder: LiveCoverageRecorder, elapsed: float,
                         total_frames: int):
     """打印实时覆盖的最终汇总。"""
+    work_sec = recorder._work_elapsed
+    if recorder._work_start_time is not None:
+        work_sec = elapsed - recorder._work_start_time
     print(f"\n{'='*50}")
     print(f"  实时覆盖录制汇总")
     print(f"{'='*50}")
-    print(f"  录制时长:     {elapsed:.1f} s")
+    print(f"  总录制时长:   {elapsed:.1f} s")
+    if recorder._work_start_time is not None:
+        print(f"  有效工作时长: {work_sec:.1f} s")
     print(f"  总帧数:       {total_frames}")
     print(f"  有效轨迹点:   {recorder._trajectory_points}")
     if recorder._total_passable > 0:
-        cov = int(np.sum((recorder._covered_count > 0) & recorder._passable_mask))
-        rep = int(np.sum((recorder._covered_count >= 2) & recorder._passable_mask))
-        print(f"  区域覆盖率:   {cov/recorder._total_passable*100:.1f}%")
-        print(f"  重复覆盖率:   {rep/recorder._total_passable*100:.1f}%")
+        covered_mask = (recorder._covered_count > 0) & recorder._passable_mask
+        N_total = int(np.sum(covered_mask))
+        N_re = int(np.sum((recorder._covered_count > 2) & recorder._passable_mask))
+        print(f"  区域覆盖率:   {N_total/recorder._total_passable*100:.1f}%")
+        print(f"  重复覆盖率:   {(N_re/N_total*100) if N_total>0 else 0:.1f}%  "
+              f"(N_re={N_re}, N_total={N_total}, >2次重叠)")
         print(f"  轨迹长度:     {recorder._trajectory_len:.2f} m")
     print(f"{'='*50}")
 
@@ -467,6 +572,8 @@ def main():
                         help="车顶 ArUco ID (默认: 4)")
     parser.add_argument("--calib-frames", type=int, default=30,
                         help="标定稳定帧数，越大越抗抖动但需等越久 (默认: 30)")
+    parser.add_argument("--interpolate", action="store_true",
+                        help="ArUco 短暂丢失时线性插值连接轨迹")
 
     # 离线分析参数（--record 模式下可选）
     parser.add_argument("--analyze", action="store_true",
@@ -551,6 +658,7 @@ def main():
             mask_path=args.mask,
             color_lower=color_lower,
             color_upper=color_upper,
+            interpolate=args.interpolate,
         )
 
     print("\n完成 ✓")

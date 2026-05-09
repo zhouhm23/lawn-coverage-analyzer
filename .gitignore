@@ -23,6 +23,7 @@ Thumbs.db
 *.mp4
 coverage_results/
 *.csv
+*.png
 
 # Jupyter
 .ipynb_checkpoints/
