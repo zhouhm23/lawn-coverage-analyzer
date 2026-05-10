@@ -454,81 +454,96 @@ def generate_overlay_image(bg_frame: np.ndarray,
                            config: CameraCoverageConfig,
                            output_path: str,
                            traj_len: float = 0.0) -> None:
-    """生成论文用实物叠加图：摄像头画面 + 红色条带覆盖 + 绿色轨迹线。
+    """生成论文用俯视修正叠加图：拍平为俯视图 + 红色条带覆盖 + 绿色轨迹线。
 
-    原理（条带扫描法）：
-        1. 将论文坐标轨迹点用单应逆矩阵映射回图像坐标
-        2. 以割草宽度 (2×coverage_radius) 为线宽，画红色半透明折线 = 覆盖条带
-        3. 叠加细绿色折线 = 轨迹中心线
-        4. 左上角标注图例与指标
+    原理：
+        1. 用单应矩阵 H 将透视背景帧 warp 成正俯视图（论文坐标系）
+        2. 在俯视图上画红色半透明条带 = 覆盖区域（轨迹 × 割草宽度）
+        3. 叠加绿色细线 = 轨迹中心线
 
     Args:
-        bg_frame:      背景帧 (H, W, 3) BGR
+        bg_frame:      背景帧 (H, W, 3) BGR（透视视角的摄像头画面）
         homography:    图像→论文的单应矩阵 H
         trajectory:    [(t, x_paper, y_paper), ...] 轨迹点（论文坐标）
-        covered_count: 未使用（保留兼容）
-        passable_mask: 未使用（保留兼容）
+        covered_count: (grid_h, grid_w) 覆盖计数，用于生成灰色未覆盖区域
+        passable_mask: (grid_h, grid_w) 可通行蒙版
         config:        参数配置
         output_path:   输出 PNG 路径
-        traj_len:      轨迹长度 m（用于标注）
+        traj_len:      轨迹长度 m（无需在此函数用）
     """
-    img_h, img_w = bg_frame.shape[:2]
-    coverage_width_m = 2.0 * config.coverage_radius  # 割草宽度 (m)
+    pap_w = config.paper_width
+    pap_h = config.paper_height
+    coverage_width_m = 2.0 * config.coverage_radius
 
-    # ── 1. 估算割草宽度对应的像素数 ──────────────────────
-    # 在论文区域中心附近取两个相距 coverage_width_m 的点，映射到图像测像素距
-    cx_paper = config.paper_width / 2.0
-    cy_paper = config.paper_height / 2.0
-    p1 = paper_to_image((cx_paper, cy_paper), homography)
-    p2 = paper_to_image((cx_paper + coverage_width_m, cy_paper), homography)
-    pixel_width = max(int(np.hypot(p2[0] - p1[0], p2[1] - p1[1])), 4)
-    # 多测几个位置取平均
-    test_pts = [
-        ((0.2, 0.2), (0.2 + coverage_width_m, 0.2)),
-        ((config.paper_width - 0.2, config.paper_height - 0.2),
-         (config.paper_width - 0.2 - coverage_width_m, config.paper_height - 0.2)),
-    ]
-    for (ax, ay), (bx, by) in test_pts:
-        q1 = paper_to_image((ax, ay), homography)
-        q2 = paper_to_image((bx, by), homography)
-        pw = int(np.hypot(q2[0] - q1[0], q2[1] - q1[1]))
-        pixel_width = max(pixel_width, pw, 4)
-    # 限制最大线宽以防过于夸张
-    pixel_width = min(pixel_width, 120)
+    # ── 1. 计算俯视图输出尺寸 ──────────────────────────
+    # 按分辨率决定像素尺寸：paper / resolution
+    out_w = int(pap_w / config.resolution)
+    out_h = int(pap_h / config.resolution)
 
-    # ── 2. 映射轨迹点到图像坐标 ─────────────────────────
-    # 抽稀：最多 2000 个点
-    step = max(1, len(trajectory) // 2000)
-    pts_img = []
-    for i in range(0, len(trajectory), step):
-        _, px, py = trajectory[i]
-        ix, iy = paper_to_image((px, py), homography)
-        if 0 <= ix < img_w and 0 <= iy < img_h:
-            pts_img.append((int(ix), int(iy)))
+    # ── 2. 将透视背景 warp 为俯视图 ─────────────────────
+    # 构建俯视图四个角在图像空间的对应关系
+    src_corners = np.array([
+        paper_to_image((0.0, 0.0), homography),
+        paper_to_image((pap_w, 0.0), homography),
+        paper_to_image((pap_w, pap_h), homography),
+        paper_to_image((0.0, pap_h), homography),
+    ], dtype=np.float32)
+    dst_corners = np.array([
+        [0, out_h],           # 左下
+        [out_w, out_h],      # 右下
+        [out_w, 0],          # 右上
+        [0, 0],              # 左上
+    ], dtype=np.float32)
+    M = cv2.getPerspectiveTransform(src_corners, dst_corners)
+    top_view = cv2.warpPerspective(bg_frame, M, (out_w, out_h),
+                                   flags=cv2.INTER_LINEAR)
 
-    if len(pts_img) < 2:
-        print("⚠ 轨迹点不足，无法生成叠加图")
-        cv2.imwrite(output_path, bg_frame)
-        return
+    # ── 3. 生成未覆盖区域灰色底衬 ───────────────────────
+    if covered_count is not None and passable_mask is not None:
+        uncovered = (~(covered_count > 0)) & passable_mask
+        uncovered_img = np.zeros((passable_mask.shape[0], passable_mask.shape[1], 3),
+                                 dtype=np.uint8)
+        uncovered_img[uncovered] = [210, 210, 210]  # 浅灰
+        # 放大到俯视图尺寸
+        uncovered_resized = cv2.resize(uncovered_img, (out_w, out_h),
+                                       interpolation=cv2.INTER_NEAREST)
+        alpha = 0.3
+        mask_3ch = np.any(uncovered_resized > 0, axis=2)
+        for c in range(3):
+            top_view[:, :, c] = np.where(
+                mask_3ch,
+                (top_view[:, :, c] * (1 - alpha) +
+                 uncovered_resized[:, :, c] * alpha).astype(np.uint8),
+                top_view[:, :, c])
 
-    # ── 3. 绘制红色覆盖条带（粗线 + 半透明）─────────────
-    overlay = bg_frame.copy()
-    pts_arr = np.array(pts_img, dtype=np.int32).reshape((-1, 1, 2))
-    cv2.polylines(overlay, [pts_arr], isClosed=False,
-                  color=(0, 0, 255), thickness=pixel_width,
-                  lineType=cv2.LINE_AA)
-    cv2.addWeighted(overlay, 0.35, bg_frame, 0.65, 0, bg_frame)
+    # ── 4. 在俯视图上绘制红色覆盖条带 ──────────────────
+    # 条带宽度：按分辨率换算
+    strip_px = max(int(coverage_width_m / config.resolution), 2)
 
-    # ── 4. 绘制绿色轨迹中心线 ──────────────────────────
-    cv2.polylines(bg_frame, [pts_arr], isClosed=False,
-                  color=(0, 255, 0), thickness=2, lineType=cv2.LINE_AA)
+    if len(trajectory) > 1:
+        pts_flat = []
+        for _, px, py in trajectory:
+            # 论文坐标 → 俯图像素
+            ix = int(px / config.resolution)
+            iy = out_h - int(py / config.resolution)  # y 翻转
+            if 0 <= ix < out_w and 0 <= iy < out_h:
+                pts_flat.append((ix, iy))
 
-    # ── 5. 绘制绿色轨迹中心线 ──────────────────────────
-    cv2.polylines(bg_frame, [pts_arr], isClosed=False,
-                  color=(0, 255, 0), thickness=2, lineType=cv2.LINE_AA)
+        if len(pts_flat) >= 2:
+            pts_arr = np.array(pts_flat, dtype=np.int32).reshape((-1, 1, 2))
+            # 红色半透明条带
+            overlay = top_view.copy()
+            cv2.polylines(overlay, [pts_arr], isClosed=False,
+                          color=(0, 0, 255), thickness=strip_px,
+                          lineType=cv2.LINE_AA)
+            cv2.addWeighted(overlay, 0.35, top_view, 0.65, 0, top_view)
+            # 绿色轨迹中心线
+            cv2.polylines(top_view, [pts_arr], isClosed=False,
+                          color=(0, 255, 0), thickness=2, lineType=cv2.LINE_AA)
 
-    cv2.imwrite(output_path, bg_frame)
-    print(f"  → 覆盖叠加图已保存: {output_path}  (条带宽={pixel_width}px)")
+    cv2.imwrite(output_path, top_view)
+    print(f"  → 俯视叠加图已保存: {output_path}  "
+          f"({out_w}×{out_h}, 条带宽={strip_px}px)")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
