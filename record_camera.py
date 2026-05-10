@@ -18,7 +18,9 @@ import argparse
 import os
 import sys
 import time
+import csv
 from collections import deque
+from datetime import datetime
 from typing import Deque, Dict, List, Optional, Tuple
 
 import cv2
@@ -97,6 +99,7 @@ from camera_coverage import (
     mask_to_passable_grid,
     create_mask_from_color,
     create_all_passable_mask,
+    generate_overlay_image,
 )
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -191,6 +194,10 @@ class LiveCoverageRecorder:
         self._last_valid_pt: Optional[Tuple[float, float]] = None
         self._lost_frames_count: int = 0
         self._max_interp_frames: int = 5  # 最多插值帧数
+
+        # 论文坐标轨迹（用于导出叠加图）
+        self._paper_trajectory: List[Tuple[float, float, float]] = []
+        self._bg_frame: Optional[np.ndarray] = None  # 首帧（用于叠加图背景）
 
         # 校准状态
         self._calibrated = False
@@ -310,6 +317,10 @@ class LiveCoverageRecorder:
                 self._trajectory_len += d
         self._last_pt = paper_pt
 
+        # 记录论文坐标轨迹（用于导出叠加图，每 3 帧存一次以节省内存）
+        if self._trajectory_points % 3 == 0:
+            self._paper_trajectory.append((0.0, px, py))
+
         # ── 计算实时指标（条带面积法）────────────────────────────
         # 重复覆盖率 = (轨迹扫过的条带总面积 - 唯一覆盖面积) / 条带总面积
         # 车直行时条带≈唯一面积 → 低重复；原地转弯时条带增加但唯一面积不变 → 高重复
@@ -422,10 +433,11 @@ def live_coverage(config: CameraCoverageConfig,
     aruco_params = cv2.aruco.DetectorParameters()
     aruco_detector = cv2.aruco.ArucoDetector(aruco_dict, aruco_params)
 
-    print(f"等待 ArUco 角点稳定标定 (ID=0,1,2,3, 需连续 {config.calib_frames} 帧)... 按 'q' 退出")
+    print(f"等待 ArUco 角点稳定标定 (ID=0,1,2,3, 需连续 {config.calib_frames} 帧)... 按 'q' 直接退出 / 'f' 完成任务")
     calibration_attempts = 0
     frame_idx = 0
     t_start = time.time()
+    exit_mode = "quit"  # "quit" 或 "finish"
 
     while True:
         ret, frame = cap.read()
@@ -446,6 +458,8 @@ def live_coverage(config: CameraCoverageConfig,
                 elif mask_img is None:
                     mask_img = create_all_passable_mask(frame.shape)
                 recorder.init_grid(mask_img)
+                # 保存标定完成时的帧作为叠加图背景
+                recorder._bg_frame = frame.copy()
                 print("开始实时覆盖分析...")
 
             # 显示标定状态
@@ -457,7 +471,7 @@ def live_coverage(config: CameraCoverageConfig,
             _put_chinese_text(disp,
                 f"CALIBRATING [{buf_len}/{total}]  (attempt {calibration_attempts})",
                 (20, 20), font_size=22, color=(0, 255, 255), thickness=2)
-            cv2.imshow("Live Coverage — 按 'q' 退出", disp)
+            cv2.imshow("Live Coverage — 按 'q' 退出 / 'f' 完成任务", disp)
         else:
             # 检测机器人 ArUco
             corners, ids, _ = aruco_detector.detectMarkers(frame)
@@ -486,11 +500,16 @@ def live_coverage(config: CameraCoverageConfig,
 
             # 显示
             disp = _resize_to_screen(frame)
-            cv2.imshow("Live Coverage — 按 'q' 退出", disp)
+            cv2.imshow("Live Coverage — 按 'q' 退出 / 'f' 完成任务", disp)
 
         frame_idx += 1
 
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            exit_mode = "quit"
+            break
+        elif key == ord('f'):
+            exit_mode = "finish"
             break
 
     cap.release()
@@ -498,18 +517,54 @@ def live_coverage(config: CameraCoverageConfig,
         writer.release()
     cv2.destroyAllWindows()
 
+    elapsed = time.time() - t_start
+
+    # ── 按 f 完成任务：视频加时间后缀 + 保存临时结果 + 导出叠加图 ─
+    if exit_mode == "finish" and output_video:
+        ts = datetime.now().strftime("%m%d%H%M")
+        dirname = os.path.dirname(output_video) or "."
+        basename = os.path.splitext(os.path.basename(output_video))[0]
+
+        # 视频加时间后缀
+        if os.path.exists(output_video):
+            stamped_path = os.path.join(dirname, f"{basename}{ts}.mp4")
+            os.rename(output_video, stamped_path)
+            print(f"\n✓ 视频已保存: {stamped_path}")
+        else:
+            stamped_path = output_video
+
+        # 保存临时测试结果
+        _save_temp_results(recorder, elapsed, frame_idx, stamped_path)
+
+        # 导出论文叠加图
+        if recorder._bg_frame is not None and recorder._homography is not None \
+                and recorder._covered_count is not None and recorder._passable_mask is not None \
+                and len(recorder._paper_trajectory) > 1:
+            overlay_path = os.path.join(dirname, f"{basename}{ts}_overlay.png")
+            generate_overlay_image(
+                bg_frame=recorder._bg_frame.copy(),
+                homography=recorder._homography,
+                trajectory=recorder._paper_trajectory,
+                covered_count=recorder._covered_count,
+                passable_mask=recorder._passable_mask,
+                config=recorder.config,
+                output_path=overlay_path,
+                traj_len=recorder._trajectory_len,
+            )
+
     # 打印最终统计
-    _print_live_summary(recorder, time.time() - t_start, frame_idx)
+    _print_live_summary(recorder, elapsed, frame_idx, exit_mode)
 
 
 def _print_live_summary(recorder: LiveCoverageRecorder, elapsed: float,
-                        total_frames: int):
+                        total_frames: int, exit_mode: str = "quit"):
     """打印实时覆盖的最终汇总。"""
     work_sec = recorder._work_elapsed
     if recorder._work_start_time is not None:
         work_sec = elapsed - recorder._work_start_time
     print(f"\n{'='*50}")
-    print(f"  实时覆盖录制汇总")
+    mode_label = "任务完成" if exit_mode == "finish" else "手动退出"
+    print(f"  实时覆盖录制汇总 ({mode_label})")
     print(f"{'='*50}")
     print(f"  总录制时长:   {elapsed:.1f} s")
     if recorder._work_start_time is not None:
@@ -531,6 +586,53 @@ def _print_live_summary(recorder: LiveCoverageRecorder, elapsed: float,
               f"(条带={total_stroke:.3f}m², 唯一覆盖={unique_area:.3f}m²)")
         print(f"  轨迹长度:     {recorder._trajectory_len:.2f} m")
     print(f"{'='*50}")
+
+
+def _save_temp_results(recorder: LiveCoverageRecorder, elapsed: float,
+                       total_frames: int, video_path: str):
+    """按 f 完成任务时保存临时测试结果（不覆盖覆盖率实验.csv）。
+
+    生成 temp_result_MMDDHHMM.csv，用户手动确认后自行写入覆盖率实验.csv。
+    """
+    ts = datetime.now().strftime("%m%d%H%M")
+    temp_path = f"./temp_result_{ts}.csv"
+
+    work_sec = elapsed
+    if recorder._work_start_time is not None:
+        work_sec = elapsed - recorder._work_start_time
+
+    N_total = 0
+    rep_cov = 0.0
+    total_stroke = 0.0
+    unique_area = 0.0
+    if recorder._total_passable > 0:
+        cfg = recorder.config
+        N_total = int(np.sum((recorder._covered_count > 0) & recorder._passable_mask))
+        coverage_width = 2.0 * cfg.coverage_radius
+        total_stroke = recorder._trajectory_len * coverage_width
+        unique_area = N_total * (cfg.resolution ** 2)
+        if total_stroke > 1e-9:
+            rep_cov = max(0.0, (total_stroke - unique_area) / total_stroke)
+
+    with open(temp_path, 'w', newline='', encoding='utf-8-sig') as f:
+        w = csv.writer(f)
+        w.writerow(["指标", "值", "备注"])
+        w.writerow(["视频文件", video_path, ""])
+        w.writerow(["总录制时长 (s)", f"{elapsed:.1f}", ""])
+        w.writerow(["有效工作时长 (s)", f"{work_sec:.1f}", ""])
+        w.writerow(["总帧数", total_frames, ""])
+        w.writerow(["有效轨迹点", recorder._trajectory_points, ""])
+        w.writerow(["区域覆盖率", f"{N_total/recorder._total_passable*100:.1f}%",
+                     f"已覆盖{N_total}/{recorder._total_passable}格"])
+        w.writerow(["重复覆盖率", f"{rep_cov*100:.1f}%",
+                     f"条带={total_stroke:.3f}m², 唯一覆盖={unique_area:.3f}m²"])
+        w.writerow(["轨迹长度 (m)", f"{recorder._trajectory_len:.2f}", ""])
+        w.writerow(["割草宽度 (m)", f"{2.0*recorder.config.coverage_radius:.3f}", ""])
+        w.writerow(["覆盖半径 (m)", f"{recorder.config.coverage_radius:.3f}", ""])
+        w.writerow(["网格分辨率 (m)", f"{recorder.config.resolution:.4f}", ""])
+
+    print(f"✓ 临时结果已保存: {temp_path}")
+    print(f"  请确认后手动写入 覆盖率实验.csv")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -578,8 +680,8 @@ def main():
                         help="HSV 上界，逗号分隔，如 '85,255,255'")
 
     # 覆盖参数
-    parser.add_argument("--coverage-radius", type=float, default=0.12,
-                        help="覆盖半径 m (默认: 0.12)")
+    parser.add_argument("--coverage-radius", type=float, default=0.085,
+                        help="覆盖半径 m (默认: 0.085)")
     parser.add_argument("--resolution", type=float, default=0.005,
                         help="网格分辨率 m (默认: 0.005)")
     parser.add_argument("--robot-id", type=int, default=4,

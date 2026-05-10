@@ -24,13 +24,16 @@ python record_camera.py --live --color-lower 35,50,50 --color-upper 85,255,255
 python record_camera.py --live
 
 # 用蒙版文件 + ArUco 插值（减少轨迹断点，识别差时再用）
-python record_camera.py --live --mask mask.png --calib-frames 2 --interpolate
+python record_camera.py --live --mask mask.png --calib-frames 2
 
 # 用颜色提取（绿色地板示例）
 python record_camera.py --live --color-lower 35,50,50 --color-upper 85,255,255
 ```
 
-操作：摆好摄像头 → 角点 ArUco 自动标定 → 启动割草机 → 右下角实时看覆盖率 → 按 q 退出。
+操作：摆好摄像头 → 角点 ArUco 自动标定 → 启动割草机 → 右下角实时看覆盖率。
+- **按 `q`**：直接退出（不重命名视频）
+- **按 `f`**：完成任务 → 视频加时间后缀（如 `camera_record05101600.mp4`）+ 保存 `temp_result_xxx.csv` 临时结果（需手动确认后写入 覆盖率实验.csv）
+
 录制视频为**原始画面**（无标注叠加），可随时离线重新分析。
 
 > 如果角点检测闪烁，画面会显示 `CALIBRATING [N/3]` 进度条。标定需要连续 3 帧稳定检测到 4 角。
@@ -40,7 +43,12 @@ python record_camera.py --live --color-lower 35,50,50 --color-upper 85,255,255
 
 ```bash
 python record_camera.py --record --output demo.mp4
+
+# 离线分析（默认每秒处理1帧，车速0.26m/s下安全；如需逐帧可用 --frame-skip 1）
 python run_camera_coverage.py --video demo.mp4 --mask mask.png --visualize
+
+# 导出论文插图（实物照 + 红色条带覆盖 + 绿色轨迹中心线）
+python run_camera_coverage.py --video camera_record05101600.mp4 --mask mask.png --export-overlay
 ```
 
 ### 4. 单张图片测试
@@ -132,3 +140,16 @@ python record_camera.py --live --mask mask.png --min-movement 0.015
 > 工作时长 = 632.6 − 24 = **608.6s**，
 > N_total = 158004，唯一覆盖 = 3.950m²，条带 = 17.72×0.24 = 4.253m²，
 > 重复覆盖率 = (4.253−3.950)/4.253 ≈ **7.1%** ✓
+>
+### 测试3
+```text
+创新组：
+
+总录制时长:   575.3 s - 25s -26s
+有效工作时长: 572.9 s
+总帧数:       15954
+有效轨迹点:   8999
+区域覆盖率:   86.7%
+重复覆盖率:   15.1%  (条带=4.366m², 唯一覆盖=3.705m²)
+轨迹长度:     18.19 m
+```

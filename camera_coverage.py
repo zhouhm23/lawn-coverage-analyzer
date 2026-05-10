@@ -38,7 +38,7 @@ class CameraCoverageConfig:
     resolution: float = 0.005          # m (5mm)
 
     # 覆盖半径（小车有效作业宽度的一半）
-    coverage_radius: float = 0.12      # m
+    coverage_radius: float = 0.085      # m
 
     # ArUco 参数
     aruco_dict: int = cv2.aruco.DICT_4X4_50
@@ -57,7 +57,7 @@ class CameraCoverageConfig:
     video_fps: float = 0.0
 
     # 处理帧间隔（每 N 帧处理一次）
-    frame_skip: int = 1
+    frame_skip: int = 30          # 默认每秒处理一帧 (30fps → 1fps)
 
     # 时间曲线采样间隔（帧数）
     time_series_interval: int = 30
@@ -299,7 +299,7 @@ def accumulate_coverage(trajectory: List[Tuple[float, float, float]],
 def compute_metrics(covered_count: np.ndarray,
                     passable_mask: np.ndarray,
                     trajectory_len: float,
-                    coverage_radius: float = 0.12,
+                    coverage_radius: float = 0.085,
                     resolution: float = 0.005) -> Dict[str, float]:
     """从覆盖计数和可通行蒙版计算四项指标。
 
@@ -443,6 +443,95 @@ def compute_trajectory_length(trajectory: List[Tuple[float, float, float]],
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# 论文插图：实物照片 + 轨迹 + 覆盖叠加
+# ═══════════════════════════════════════════════════════════════════════════
+
+def generate_overlay_image(bg_frame: np.ndarray,
+                           homography: np.ndarray,
+                           trajectory: List[Tuple[float, float, float]],
+                           covered_count: np.ndarray,
+                           passable_mask: np.ndarray,
+                           config: CameraCoverageConfig,
+                           output_path: str,
+                           traj_len: float = 0.0) -> None:
+    """生成论文用实物叠加图：摄像头画面 + 红色条带覆盖 + 绿色轨迹线。
+
+    原理（条带扫描法）：
+        1. 将论文坐标轨迹点用单应逆矩阵映射回图像坐标
+        2. 以割草宽度 (2×coverage_radius) 为线宽，画红色半透明折线 = 覆盖条带
+        3. 叠加细绿色折线 = 轨迹中心线
+        4. 左上角标注图例与指标
+
+    Args:
+        bg_frame:      背景帧 (H, W, 3) BGR
+        homography:    图像→论文的单应矩阵 H
+        trajectory:    [(t, x_paper, y_paper), ...] 轨迹点（论文坐标）
+        covered_count: 未使用（保留兼容）
+        passable_mask: 未使用（保留兼容）
+        config:        参数配置
+        output_path:   输出 PNG 路径
+        traj_len:      轨迹长度 m（用于标注）
+    """
+    img_h, img_w = bg_frame.shape[:2]
+    coverage_width_m = 2.0 * config.coverage_radius  # 割草宽度 (m)
+
+    # ── 1. 估算割草宽度对应的像素数 ──────────────────────
+    # 在论文区域中心附近取两个相距 coverage_width_m 的点，映射到图像测像素距
+    cx_paper = config.paper_width / 2.0
+    cy_paper = config.paper_height / 2.0
+    p1 = paper_to_image((cx_paper, cy_paper), homography)
+    p2 = paper_to_image((cx_paper + coverage_width_m, cy_paper), homography)
+    pixel_width = max(int(np.hypot(p2[0] - p1[0], p2[1] - p1[1])), 4)
+    # 多测几个位置取平均
+    test_pts = [
+        ((0.2, 0.2), (0.2 + coverage_width_m, 0.2)),
+        ((config.paper_width - 0.2, config.paper_height - 0.2),
+         (config.paper_width - 0.2 - coverage_width_m, config.paper_height - 0.2)),
+    ]
+    for (ax, ay), (bx, by) in test_pts:
+        q1 = paper_to_image((ax, ay), homography)
+        q2 = paper_to_image((bx, by), homography)
+        pw = int(np.hypot(q2[0] - q1[0], q2[1] - q1[1]))
+        pixel_width = max(pixel_width, pw, 4)
+    # 限制最大线宽以防过于夸张
+    pixel_width = min(pixel_width, 120)
+
+    # ── 2. 映射轨迹点到图像坐标 ─────────────────────────
+    # 抽稀：最多 2000 个点
+    step = max(1, len(trajectory) // 2000)
+    pts_img = []
+    for i in range(0, len(trajectory), step):
+        _, px, py = trajectory[i]
+        ix, iy = paper_to_image((px, py), homography)
+        if 0 <= ix < img_w and 0 <= iy < img_h:
+            pts_img.append((int(ix), int(iy)))
+
+    if len(pts_img) < 2:
+        print("⚠ 轨迹点不足，无法生成叠加图")
+        cv2.imwrite(output_path, bg_frame)
+        return
+
+    # ── 3. 绘制红色覆盖条带（粗线 + 半透明）─────────────
+    overlay = bg_frame.copy()
+    pts_arr = np.array(pts_img, dtype=np.int32).reshape((-1, 1, 2))
+    cv2.polylines(overlay, [pts_arr], isClosed=False,
+                  color=(0, 0, 255), thickness=pixel_width,
+                  lineType=cv2.LINE_AA)
+    cv2.addWeighted(overlay, 0.35, bg_frame, 0.65, 0, bg_frame)
+
+    # ── 4. 绘制绿色轨迹中心线 ──────────────────────────
+    cv2.polylines(bg_frame, [pts_arr], isClosed=False,
+                  color=(0, 255, 0), thickness=2, lineType=cv2.LINE_AA)
+
+    # ── 5. 绘制绿色轨迹中心线 ──────────────────────────
+    cv2.polylines(bg_frame, [pts_arr], isClosed=False,
+                  color=(0, 255, 0), thickness=2, lineType=cv2.LINE_AA)
+
+    cv2.imwrite(output_path, bg_frame)
+    print(f"  → 覆盖叠加图已保存: {output_path}  (条带宽={pixel_width}px)")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # 主分析器
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -467,6 +556,7 @@ class CameraCoverageAnalyzer:
         self._lost_frames: int = 0
         self._total_frames: int = 0
         self._mask_img: Optional[np.ndarray] = None
+        self._bg_frame: Optional[np.ndarray] = None  # 首帧（用于叠加图）
 
     # ── 属性 ──────────────────────────────────────────────────────────
 
@@ -522,6 +612,7 @@ class CameraCoverageAnalyzer:
         ret, first_frame = cap.read()
         if not ret:
             raise RuntimeError("无法读取视频首帧")
+        self._bg_frame = first_frame.copy()  # 保存首帧用于叠加图
 
         # 重置到开头，传入 cap 以支持多帧扫描
         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)

@@ -23,6 +23,7 @@ if _script_dir not in sys.path:
 from camera_coverage import (  # type: ignore
     CameraCoverageAnalyzer,
     CameraCoverageConfig,
+    generate_overlay_image,
 )
 
 
@@ -37,12 +38,14 @@ def main():
                         help="输出目录 (默认: ./coverage_results)")
     parser.add_argument("--visualize", action="store_true",
                         help="生成可视化图像（coverage_overlay.png + coverage_curve.png）")
+    parser.add_argument("--export-overlay", action="store_true",
+                        help="导出论文插图：实物照 + 绿色轨迹 + 红色覆盖叠加")
     parser.add_argument("--start-frame", type=int, default=0,
                         help="起始帧 (默认: 0)")
     parser.add_argument("--end-frame", type=int, default=-1,
                         help="结束帧 (默认: -1 = 到结尾)")
-    parser.add_argument("--frame-skip", type=int, default=1,
-                        help="处理帧间隔，默认每帧处理")
+    parser.add_argument("--frame-skip", type=int, default=30,
+                        help="处理帧间隔 (默认: 30 ≈ 1fps@30fps视频，车速0.26m/s下安全)")
     parser.add_argument("--calib-frames", type=int, default=3,
                         help="标定稳定帧数，越大越抗抖动 (默认: 3)")
     parser.add_argument("--coverage-radius", type=float, default=0.12,
@@ -91,6 +94,26 @@ def main():
     if args.visualize:
         print("生成可视化...")
         analyzer.generate_visualizations(args.output, prefix)
+
+    # 导出论文叠加图
+    if args.export_overlay:
+        if analyzer._bg_frame is None or analyzer.homography is None:
+            print("⚠ 无法导出叠加图：缺少背景帧或单应矩阵")
+        elif not analyzer.trajectory:
+            print("⚠ 无法导出叠加图：无轨迹数据")
+        else:
+            overlay_path = os.path.join(args.output, f"{prefix}_overlay.png")
+            traj_len = analyzer.metrics.get("trajectory_length_m", 0.0)
+            generate_overlay_image(
+                bg_frame=analyzer._bg_frame.copy(),
+                homography=analyzer.homography,
+                trajectory=analyzer.trajectory,
+                covered_count=analyzer.covered_count,
+                passable_mask=analyzer.passable_mask,
+                config=analyzer.config,
+                output_path=overlay_path,
+                traj_len=traj_len,
+            )
 
     print("\n完成 ✓")
 
