@@ -48,7 +48,7 @@ python record_camera.py --record --output demo.mp4
 python run_camera_coverage.py --video demo.mp4 --mask mask.png --visualize
 
 # 导出论文插图（实物照 + 红色条带覆盖 + 绿色轨迹中心线）
-python run_camera_coverage.py --video camera_record05101600.mp4 --mask mask.png --export-overlay
+python run_camera_coverage.py --video camera_record05102100.mp4 --mask mask.png --export-overlay
 ```
 
 ### 4. 单张图片测试
@@ -102,17 +102,17 @@ python test_aruco.py --camera
 ### 1. 中文字体
 集成 PIL/Pillow，自动检测系统中文字体。需 `pip install Pillow`。
 
-### 2. 重复覆盖率公式修正 (v1.3 条带面积法)
-**旧方案（v1.1-1.2，已废弃）**: 逐像素统计重叠次数 > 2，但正常直行每格就被碾压约 27 次（半径 12cm / 每帧 8.7mm），阈值毫无意义。
+### 2. 重复覆盖率公式 (v2.0 网格自适应阈值法)
+**旧方案（v1.3 条带面积法，已废弃）**: 依赖轨迹长度做乘数，轨迹长度本身随采样率剧烈变化（1Hz≈31m / 30Hz≈16m），公式不自洽。
 
-**新方案（条带面积法）**:
-$$R = \frac{\text{轨迹长度} \times \text{割草宽度} - \text{唯一覆盖面积}}{\text{轨迹长度} \times \text{割草宽度}} \times 100\%$$
+**新方案（采样率无关）**:
+$$h = \left\lceil\frac{2R}{\text{avg\_dist}}\right\rceil, \quad R = \frac{N_{count > h}}{N_{count > 0}} \times 100\%$$
 
-- 割草宽度 = 2 × coverage_radius = 0.24m
-- 唯一覆盖面积 = 覆盖格数 × resolution²
-- **直行**: 条带面积 ≈ 唯一覆盖面积 → R ≈ 0%
-- **原地转弯**: 条带面积增加，唯一覆盖不变 → R 上升 ✓
-- **重复碾压**: 条带远超唯一覆盖 → R 高 ✓
+- $h$: 单次扫过一个格被命中的预期次数（随采样率自适应）
+- $R$: 割草半径，$\text{avg\_dist}$: 平均帧间距离
+- 30Hz: $\text{avg\_dist}$≈0.87mm, $h$≈20, count>20 才算重复
+- 1Hz: $\text{avg\_dist}$≈5.3cm, $h$=4, count>4 才算重复
+- 两种采样率自然给出相近的重复覆盖率 ✓
 
 ### 3. 工作时间计时
 从首次检测到机器人 ArUco 开始计时。HUD 显示"工作时间"。
@@ -143,13 +143,28 @@ python record_camera.py --live --mask mask.png --min-movement 0.015
 >
 ### 测试3
 ```text
-创新组：
-
-总录制时长:   575.3 s - 25s -26s
-有效工作时长: 572.9 s
+视觉+改进ccpp：
+总录制时长:   575.3 s - 25s -26s=524.3
 总帧数:       15954
 有效轨迹点:   8999
 区域覆盖率:   86.7%
 重复覆盖率:   15.1%  (条带=4.366m², 唯一覆盖=3.705m²)
 轨迹长度:     18.19 m
+
+雷达+原始ccpp：
+总录制时长:   928.0 s - 67s - 3s=858
+总帧数:       22837
+有效轨迹点:   17977
+区域覆盖率:   66.1%
+重复覆盖率:   0.0%  (条带=2.653m², 唯一覆盖=2.810m²)
+轨迹长度:     15.61 m
+
+python run_camera_coverage.py --video camera_record05102100.mp4 --mask mask2100.png --export-overlay 
+区域覆盖率:      50.31 %
+重复覆盖率:      23.88 %
+覆盖效率:       0.0158 m⁻¹
+轨迹总长度:      31.90 m
+可通行总面积:    4.252 m²
+有效/总帧:      604/762
+⚠ ArUco 丢失率 20.7% > 5%，请检查视频质量！
 ```

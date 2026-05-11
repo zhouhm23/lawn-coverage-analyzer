@@ -24,6 +24,7 @@ Thumbs.db
 coverage_results/
 *.csv
 *.png
+*.xlsx
 
 # Jupyter
 .ipynb_checkpoints/

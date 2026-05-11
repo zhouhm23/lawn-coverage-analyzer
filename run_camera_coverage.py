@@ -48,8 +48,8 @@ def main():
                         help="处理帧间隔 (默认: 30 ≈ 1fps@30fps视频，车速0.26m/s下安全)")
     parser.add_argument("--calib-frames", type=int, default=3,
                         help="标定稳定帧数，越大越抗抖动 (默认: 3)")
-    parser.add_argument("--coverage-radius", type=float, default=0.12,
-                        help="覆盖半径 m (默认: 0.12)")
+    parser.add_argument("--coverage-radius", type=float, default=0.085,
+                        help="覆盖半径 m (默认: 0.085, 车宽=17cm)")
     parser.add_argument("--resolution", type=float, default=0.005,
                         help="网格分辨率 m (默认: 0.005)")
     parser.add_argument("--robot-id", type=int, default=4,

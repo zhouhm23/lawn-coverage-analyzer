@@ -321,24 +321,23 @@ class LiveCoverageRecorder:
         if self._trajectory_points % 3 == 0:
             self._paper_trajectory.append((0.0, px, py))
 
-        # ── 计算实时指标（条带面积法）────────────────────────────
-        # 重复覆盖率 = (轨迹扫过的条带总面积 - 唯一覆盖面积) / 条带总面积
-        # 车直行时条带≈唯一面积 → 低重复；原地转弯时条带增加但唯一面积不变 → 高重复
+        # ── 计算实时指标（网格自适应阈值法）─────────────────────
+        # hits_per_pass = ceil(2R / 平均帧间距)，超过此阈值的格才算过度碾压
         if self._total_passable > 0:
             N_total = int(np.sum((self._covered_count > 0) & self._passable_mask))
             area_cov = N_total / self._total_passable
 
-            coverage_width = 2.0 * cfg.coverage_radius
-            total_stroke = self._trajectory_len * coverage_width
-            unique_area = N_total * (cfg.resolution ** 2)
-            if total_stroke > 1e-9:
-                rep_cov = max(0.0, (total_stroke - unique_area) / total_stroke)
-            else:
-                rep_cov = 0.0
+            avg_d = self._trajectory_len / max(self._trajectory_points - 1, 1) \
+                if self._trajectory_points > 1 else 0.0
+            hp = max(1, int(np.ceil((2.0 * cfg.coverage_radius) / avg_d))) \
+                if avg_d > 1e-9 else 1
+            N_re = int(np.sum((self._covered_count > hp) & self._passable_mask))
+            rep_cov = (N_re / N_total) if N_total > 0 else 0.0
 
             eff = area_cov / max(self._trajectory_len, 0.01)
         else:
             area_cov = rep_cov = eff = 0.0
+            hp = 0
 
         # 工作时间
         work_sec = t_sec - (self._work_start_time or t_sec)
@@ -574,16 +573,15 @@ def _print_live_summary(recorder: LiveCoverageRecorder, elapsed: float,
     if recorder._total_passable > 0:
         cfg = recorder.config
         N_total = int(np.sum((recorder._covered_count > 0) & recorder._passable_mask))
-        coverage_width = 2.0 * cfg.coverage_radius
-        total_stroke = recorder._trajectory_len * coverage_width
-        unique_area = N_total * (cfg.resolution ** 2)
-        if total_stroke > 1e-9:
-            rep_cov = max(0.0, (total_stroke - unique_area) / total_stroke)
-        else:
-            rep_cov = 0.0
+        avg_d = recorder._trajectory_len / max(recorder._trajectory_points - 1, 1) \
+            if recorder._trajectory_points > 1 else 0.0
+        hp = max(1, int(np.ceil((2.0 * cfg.coverage_radius) / avg_d))) \
+            if avg_d > 1e-9 else 1
+        N_re = int(np.sum((recorder._covered_count > hp) & recorder._passable_mask))
+        rep_cov = (N_re / N_total) if N_total > 0 else 0.0
         print(f"  区域覆盖率:   {N_total/recorder._total_passable*100:.1f}%")
         print(f"  重复覆盖率:   {rep_cov*100:.1f}%  "
-              f"(条带={total_stroke:.3f}m², 唯一覆盖={unique_area:.3f}m²)")
+              f"(阈值 h={hp}, N_re={N_re}, N_total={N_total})")
         print(f"  轨迹长度:     {recorder._trajectory_len:.2f} m")
     print(f"{'='*50}")
 
@@ -603,16 +601,16 @@ def _save_temp_results(recorder: LiveCoverageRecorder, elapsed: float,
 
     N_total = 0
     rep_cov = 0.0
-    total_stroke = 0.0
-    unique_area = 0.0
+    hp = 0
     if recorder._total_passable > 0:
         cfg = recorder.config
         N_total = int(np.sum((recorder._covered_count > 0) & recorder._passable_mask))
-        coverage_width = 2.0 * cfg.coverage_radius
-        total_stroke = recorder._trajectory_len * coverage_width
-        unique_area = N_total * (cfg.resolution ** 2)
-        if total_stroke > 1e-9:
-            rep_cov = max(0.0, (total_stroke - unique_area) / total_stroke)
+        avg_d = recorder._trajectory_len / max(recorder._trajectory_points - 1, 1) \
+            if recorder._trajectory_points > 1 else 0.0
+        hp = max(1, int(np.ceil((2.0 * cfg.coverage_radius) / avg_d))) \
+            if avg_d > 1e-9 else 1
+        N_re = int(np.sum((recorder._covered_count > hp) & recorder._passable_mask))
+        rep_cov = (N_re / N_total) if N_total > 0 else 0.0
 
     with open(temp_path, 'w', newline='', encoding='utf-8-sig') as f:
         w = csv.writer(f)
@@ -625,7 +623,7 @@ def _save_temp_results(recorder: LiveCoverageRecorder, elapsed: float,
         w.writerow(["区域覆盖率", f"{N_total/recorder._total_passable*100:.1f}%",
                      f"已覆盖{N_total}/{recorder._total_passable}格"])
         w.writerow(["重复覆盖率", f"{rep_cov*100:.1f}%",
-                     f"条带={total_stroke:.3f}m², 唯一覆盖={unique_area:.3f}m²"])
+                     f"阈值h={hp}, N_re/N_total"])
         w.writerow(["轨迹长度 (m)", f"{recorder._trajectory_len:.2f}", ""])
         w.writerow(["割草宽度 (m)", f"{2.0*recorder.config.coverage_radius:.3f}", ""])
         w.writerow(["覆盖半径 (m)", f"{recorder.config.coverage_radius:.3f}", ""])
