@@ -54,8 +54,8 @@ def main():
                         help="网格分辨率 m (默认: 0.005)")
     parser.add_argument("--robot-id", type=int, default=4,
                         help="车顶 ArUco ID (默认: 4)")
-    parser.add_argument("--min-movement", type=float, default=0.01,
-                        help="最小移动距离阈值 m，低于此值视为静止抖动 (默认: 0.01)")
+    parser.add_argument("--spatial-interval", type=float, default=0.02,
+                        help="空间重采样间隔 m，消除采样频率误差 (默认: 0.02, 0=不重采样)")
     args = parser.parse_args()
 
     # 检查文件存在
@@ -73,7 +73,7 @@ def main():
         frame_skip=args.frame_skip,
         robot_id=args.robot_id,
         calib_frames=args.calib_frames,
-        min_movement=args.min_movement,
+        spatial_resample_interval=args.spatial_interval,
     )
 
     # 执行分析

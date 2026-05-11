@@ -102,17 +102,26 @@ python test_aruco.py --camera
 ### 1. 中文字体
 集成 PIL/Pillow，自动检测系统中文字体。需 `pip install Pillow`。
 
-### 2. 重复覆盖率公式 (v2.0 网格自适应阈值法)
-**旧方案（v1.3 条带面积法，已废弃）**: 依赖轨迹长度做乘数，轨迹长度本身随采样率剧烈变化（1Hz≈31m / 30Hz≈16m），公式不自洽。
+### 2. 重复覆盖率公式 (v2.1 条带面积法 + 空间重采样滤波器)
 
-**新方案（采样率无关）**:
-$$h = \left\lceil\frac{2R}{\text{avg\_dist}}\right\rceil, \quad R = \frac{N_{count > h}}{N_{count > 0}} \times 100\%$$
+**网格自适应阈值法（v2.0，已废弃）**: 依赖 `hits_per_pass` 动态阈值，但对非均匀采样场景不稳定。
 
-- $h$: 单次扫过一个格被命中的预期次数（随采样率自适应）
-- $R$: 割草半径，$\text{avg\_dist}$: 平均帧间距离
-- 30Hz: $\text{avg\_dist}$≈0.87mm, $h$≈20, count>20 才算重复
-- 1Hz: $\text{avg\_dist}$≈5.3cm, $h$=4, count>4 才算重复
-- 两种采样率自然给出相近的重复覆盖率 ✓
+**条带面积法（v2.1 回退）**:
+$$\text{repeat} = \frac{S_{\text{strip}} - S_{\text{unique}}}{S_{\text{strip}}} \times 100\%, \quad S_{\text{strip}} = L \cdot 2R, \quad S_{\text{unique}} = N_{\text{covered}} \cdot \Delta x^2$$
+
+- $S_{\text{strip}}$: 理论条带总面积 = 轨迹长度 × 割草宽度
+- $S_{\text{unique}}$: 网格唯一覆盖面积（count > 0 的格面积总和）
+- $L$: 空间重采样后的轨迹长度
+- $2R$: 割草条带宽度（= 2 × coverage_radius）
+
+**空间重采样滤波器（消除采样频率误差）**:
+将原始轨迹按固定空间间隔（默认 0.02m）均匀重采样，使轨迹长度独立于帧率。
+1Hz 和 30Hz 采样得到相近的轨迹长度 → 条带面积法结果可跨实验对比。
+
+```bash
+# 调节空间重采样间隔（0=不重采样，使用原始轨迹）
+python run_camera_coverage.py --video demo.mp4 --mask mask.png --spatial-interval 0.02
+```
 
 ### 3. 工作时间计时
 从首次检测到机器人 ArUco 开始计时。HUD 显示"工作时间"。
@@ -167,4 +176,41 @@ python run_camera_coverage.py --video camera_record05102100.mp4 --mask mask2100.
 可通行总面积:    4.252 m²
 有效/总帧:      604/762
 ⚠ ArUco 丢失率 20.7% > 5%，请检查视频质量！
+```
+
+## 测试4 (v2.1 条带面积法 + 空间重采样)
+```bash
+python run_camera_coverage.py --video camera_record05102100.mp4 --mask mask2100.png --spatial-interval 0.02
+```
+```
+区域覆盖率:      66.05 %
+重复覆盖率:      48.15 %  (条带=5.4158m², 唯一覆盖=2.8083m²)
+覆盖效率:       0.0207 m⁻¹
+轨迹总长度:      31.86 m（空间重采样后，原始=31.90m）
+可通行总面积:    4.252 m²
+有效/总帧:      604/762
+⚠ ArUco 丢失率 20.7% > 5%，请检查视频质量！
+
+camera_record05111712.mp4测试结果：
+1.在线分析，重复率明显错误
+总录制时长:   606.9 s
+有效工作时长: 600.9 s
+总帧数:       15515
+有效轨迹点:   13306
+区域覆盖率:   76.6%
+重复覆盖率:   0.0%  (条带=1.8595m², 唯一覆盖=3.2545m²)
+轨迹长度:     10.94 m
+
+2.纠正最小阈值后：
+python run_camera_coverage.py --video camera_record05111712.mp4 --mask mask2100.png --spatial-interval 0.02 --frame-skip 30 2>&1 --export-overlay
+  区域覆盖率:      76.02 %
+  重复覆盖率:      36.70 %
+    (条带=4.9314m², 唯一覆盖=3.1217m²)
+  覆盖效率:       0.0262 m⁻¹
+  轨迹总长度:      29.01 m
+  可通行总面积:    4.106 m²
+  有效/总帧:      451/518
+  ⚠ ArUco 丢失率 12.9% > 5%，请检查视频质量！
+
+  结果合理了
 ```

@@ -313,31 +313,30 @@ class LiveCoverageRecorder:
         self._trajectory_points += 1
         if self._last_pt is not None:
             d = np.hypot(px - self._last_pt[0], py - self._last_pt[1])
-            if d >= cfg.min_movement:
-                self._trajectory_len += d
+            self._trajectory_len += d
         self._last_pt = paper_pt
 
         # 记录论文坐标轨迹（用于导出叠加图，每 3 帧存一次以节省内存）
         if self._trajectory_points % 3 == 0:
             self._paper_trajectory.append((0.0, px, py))
 
-        # ── 计算实时指标（网格自适应阈值法）─────────────────────
-        # hits_per_pass = ceil(2R / 平均帧间距)，超过此阈值的格才算过度碾压
+        # ── 计算实时指标（条带面积法）─────────────────────
+        # strip_area = trajectory_len × strip_width
+        # unique_area = N_total × resolution²
+        # repeat_coverage = (strip_area - unique_area) / strip_area
+        res2 = cfg.resolution ** 2
+        strip_w = 2.0 * cfg.coverage_radius
         if self._total_passable > 0:
             N_total = int(np.sum((self._covered_count > 0) & self._passable_mask))
             area_cov = N_total / self._total_passable
 
-            avg_d = self._trajectory_len / max(self._trajectory_points - 1, 1) \
-                if self._trajectory_points > 1 else 0.0
-            hp = max(1, int(np.ceil((2.0 * cfg.coverage_radius) / avg_d))) \
-                if avg_d > 1e-9 else 1
-            N_re = int(np.sum((self._covered_count > hp) & self._passable_mask))
-            rep_cov = (N_re / N_total) if N_total > 0 else 0.0
+            unique_a = N_total * res2
+            strip_a = self._trajectory_len * strip_w
+            rep_cov = max(0.0, (strip_a - unique_a) / strip_a) if strip_a > 1e-9 else 0.0
 
             eff = area_cov / max(self._trajectory_len, 0.01)
         else:
             area_cov = rep_cov = eff = 0.0
-            hp = 0
 
         # 工作时间
         work_sec = t_sec - (self._work_start_time or t_sec)
@@ -573,15 +572,14 @@ def _print_live_summary(recorder: LiveCoverageRecorder, elapsed: float,
     if recorder._total_passable > 0:
         cfg = recorder.config
         N_total = int(np.sum((recorder._covered_count > 0) & recorder._passable_mask))
-        avg_d = recorder._trajectory_len / max(recorder._trajectory_points - 1, 1) \
-            if recorder._trajectory_points > 1 else 0.0
-        hp = max(1, int(np.ceil((2.0 * cfg.coverage_radius) / avg_d))) \
-            if avg_d > 1e-9 else 1
-        N_re = int(np.sum((recorder._covered_count > hp) & recorder._passable_mask))
-        rep_cov = (N_re / N_total) if N_total > 0 else 0.0
+        res2 = cfg.resolution ** 2
+        strip_w = 2.0 * cfg.coverage_radius
+        unique_a = N_total * res2
+        strip_a = recorder._trajectory_len * strip_w
+        rep_cov = max(0.0, (strip_a - unique_a) / strip_a) if strip_a > 1e-9 else 0.0
         print(f"  区域覆盖率:   {N_total/recorder._total_passable*100:.1f}%")
         print(f"  重复覆盖率:   {rep_cov*100:.1f}%  "
-              f"(阈值 h={hp}, N_re={N_re}, N_total={N_total})")
+              f"(条带={strip_a:.4f}m², 唯一覆盖={unique_a:.4f}m²)")
         print(f"  轨迹长度:     {recorder._trajectory_len:.2f} m")
     print(f"{'='*50}")
 
@@ -601,16 +599,16 @@ def _save_temp_results(recorder: LiveCoverageRecorder, elapsed: float,
 
     N_total = 0
     rep_cov = 0.0
-    hp = 0
+    strip_a = 0.0
+    unique_a = 0.0
     if recorder._total_passable > 0:
         cfg = recorder.config
+        res2 = cfg.resolution ** 2
+        strip_w = 2.0 * cfg.coverage_radius
         N_total = int(np.sum((recorder._covered_count > 0) & recorder._passable_mask))
-        avg_d = recorder._trajectory_len / max(recorder._trajectory_points - 1, 1) \
-            if recorder._trajectory_points > 1 else 0.0
-        hp = max(1, int(np.ceil((2.0 * cfg.coverage_radius) / avg_d))) \
-            if avg_d > 1e-9 else 1
-        N_re = int(np.sum((recorder._covered_count > hp) & recorder._passable_mask))
-        rep_cov = (N_re / N_total) if N_total > 0 else 0.0
+        unique_a = N_total * res2
+        strip_a = recorder._trajectory_len * strip_w
+        rep_cov = max(0.0, (strip_a - unique_a) / strip_a) if strip_a > 1e-9 else 0.0
 
     with open(temp_path, 'w', newline='', encoding='utf-8-sig') as f:
         w = csv.writer(f)
@@ -623,7 +621,7 @@ def _save_temp_results(recorder: LiveCoverageRecorder, elapsed: float,
         w.writerow(["区域覆盖率", f"{N_total/recorder._total_passable*100:.1f}%",
                      f"已覆盖{N_total}/{recorder._total_passable}格"])
         w.writerow(["重复覆盖率", f"{rep_cov*100:.1f}%",
-                     f"阈值h={hp}, N_re/N_total"])
+                     f"条带={strip_a:.4f}m², 唯一覆盖={unique_a:.4f}m²"])
         w.writerow(["轨迹长度 (m)", f"{recorder._trajectory_len:.2f}", ""])
         w.writerow(["割草宽度 (m)", f"{2.0*recorder.config.coverage_radius:.3f}", ""])
         w.writerow(["覆盖半径 (m)", f"{recorder.config.coverage_radius:.3f}", ""])
@@ -734,7 +732,6 @@ def main():
                 resolution=args.resolution,
                 robot_id=args.robot_id,
                 calib_frames=args.calib_frames,
-                min_movement=args.min_movement,
             )
             analyzer = CameraCoverageAnalyzer(config)
             try:
@@ -767,7 +764,6 @@ def main():
             resolution=args.resolution,
             robot_id=args.robot_id,
             calib_frames=args.calib_frames,
-            min_movement=args.min_movement,
         )
         live_coverage(
             config=config,

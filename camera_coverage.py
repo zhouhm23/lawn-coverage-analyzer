@@ -40,6 +40,14 @@ class CameraCoverageConfig:
     # 覆盖半径（小车有效作业宽度的一半）
     coverage_radius: float = 0.085      # m
 
+    # 条带面积法：割草条带宽度 = 2 × coverage_radius
+    @property
+    def strip_width(self) -> float:
+        return 2.0 * self.coverage_radius
+
+    # 空间重采样间隔 (m)，将轨迹按固定间距重采样以消除采样频率误差
+    spatial_resample_interval: float = 0.02  # 2cm
+
     # ArUco 参数
     aruco_dict: int = cv2.aruco.DICT_4X4_50
     corner_ids: Tuple[int, ...] = (0, 1, 2, 3)
@@ -71,8 +79,16 @@ class CameraCoverageConfig:
     # 蒙版参数
     mask_threshold: int = 128          # 0-255，蒙版二值化阈值
 
-    # 最小移动距离阈值 (m)，低于此距离的移动视为静止抖动，不计入轨迹长度
-    min_movement: float = 0.01         # 1cm，参考车速 0.26m/s @30fps ≈ 8.7mm/帧
+    @property
+    def min_movement(self) -> float:
+        """动态最小移动阈值：按有效采样频率自动调节，消除采样率耦合。
+
+        高频采样 → 帧间距小 → 阈值小；低频采样 → 帧间距大 → 阈值大。
+        取预期帧间距的 30%，不低于 1mm。
+        """
+        eff_fps = self.video_fps / max(self.frame_skip, 1) if self.video_fps > 0 else 1.0
+        expected_step = 0.26 / eff_fps   # 名义车速 0.26 m/s
+        return max(expected_step * 0.3, 0.001)
 
     @property
     def grid_w(self) -> int:
@@ -299,24 +315,23 @@ def accumulate_coverage(trajectory: List[Tuple[float, float, float]],
 def compute_metrics(covered_count: np.ndarray,
                     passable_mask: np.ndarray,
                     trajectory_len: float,
-                    num_points: int = 0,
-                    coverage_radius: float = 0.085,
+                    strip_width: float = 0.17,
                     resolution: float = 0.005) -> Dict[str, float]:
-    """从覆盖计数和可通行蒙版计算指标（采样率无关）。
+    """从覆盖计数和可通行蒙版计算指标（条带面积法）。
 
-    重复覆盖率（网格自适应阈值法）:
-        每次扫过，一个格被命中约 hits_per_pass = ceil(2R / 平均帧间距) 次。
-        超过此阈值的格才算「被多次碾压」，独立于采样率。
-        R = N_re / N_total × 100%
-        N_re:   covered_count > hits_per_pass 的格数
-        N_total: covered_count > 0 的格数
+    重复覆盖率（条带面积法）:
+        strip_area = trajectory_len × strip_width  （理论上扫过的条带总面积）
+        unique_area = N_total × resolution²         （网格唯一覆盖面积）
+        repeat_coverage = (strip_area - unique_area) / strip_area
+
+    该公式独立于采样帧数，只依赖轨迹长度和网格覆盖面积。
+    搭配空间重采样滤波器可消除采样频率误差。
 
     Args:
         covered_count:  (H, W) int  每格覆盖次数
         passable_mask:  (H, W) bool 可通行区域
-        trajectory_len: 轨迹总长度 (m)
-        num_points:     轨迹点数量（用于算平均帧间距）
-        coverage_radius: 覆盖半径 (m)
+        trajectory_len: 轨迹总长度 (m)，应使用空间重采样后的长度
+        strip_width:    割草条带宽度 (m) = 2 × coverage_radius
         resolution:     网格分辨率 (m)
     """
     total_passable = int(np.sum(passable_mask))
@@ -327,22 +342,21 @@ def compute_metrics(covered_count: np.ndarray,
             "coverage_efficiency": 0.0,
             "total_passable_cells": total_passable,
             "trajectory_length_m": trajectory_len,
-            "hits_per_pass": 0,
+            "unique_area_m2": 0.0,
+            "strip_area_m2": 0.0,
         }
 
     covered_mask = (covered_count > 0) & passable_mask
     N_total = int(np.sum(covered_mask))
     area_cov = N_total / total_passable
 
-    # ── 自适应阈值：每次扫过一个格被命中多少次 ───────────────
-    avg_dist = trajectory_len / max(num_points - 1, 1) if num_points > 1 else 0.0
-    if avg_dist > 1e-9:
-        hits_per_pass = max(1, int(np.ceil((2.0 * coverage_radius) / avg_dist)))
+    # ── 条带面积法 ─────────────────────────────────────
+    unique_area = N_total * (resolution ** 2)      # 网格唯一覆盖面积 (m²)
+    strip_area = trajectory_len * strip_width       # 理论条带总面积 (m²)
+    if strip_area > 1e-9:
+        repeat_cov = max(0.0, (strip_area - unique_area) / strip_area)
     else:
-        hits_per_pass = 1  # 静止单点，count>1 就是重复
-
-    N_re = int(np.sum((covered_count > hits_per_pass) & passable_mask))
-    repeat_cov = (N_re / N_total) if N_total > 0 else 0.0
+        repeat_cov = 0.0
 
     efficiency = area_cov / max(trajectory_len, 0.001)
 
@@ -352,14 +366,15 @@ def compute_metrics(covered_count: np.ndarray,
         "coverage_efficiency": efficiency,
         "total_passable_cells": total_passable,
         "trajectory_length_m": trajectory_len,
-        "hits_per_pass": hits_per_pass,
+        "unique_area_m2": unique_area,
+        "strip_area_m2": strip_area,
     }
 
 
 def compute_time_series(trajectory: List[Tuple[float, float, float]],
                         passable_mask: np.ndarray,
                         config: CameraCoverageConfig) -> List[Tuple[float, float, float]]:
-    """计算覆盖率-时间曲线（采样率无关网格阈值法）。
+    """计算覆盖率-时间曲线（条带面积法）。
 
     Returns:
         [(t_sec, area_coverage, repeat_coverage), ...]
@@ -367,6 +382,8 @@ def compute_time_series(trajectory: List[Tuple[float, float, float]],
     covered_count = np.zeros(passable_mask.shape, dtype=np.int32)
     rad_cells = int(math.ceil(config.coverage_radius / config.resolution))
     total_passable = max(int(np.sum(passable_mask)), 1)
+    strip_w = config.strip_width
+    res2 = config.resolution ** 2
     series = []
     traj_len_so_far = 0.0
     prev_pt = None
@@ -393,21 +410,17 @@ def compute_time_series(trajectory: List[Tuple[float, float, float]],
 
         if (idx + 1) % config.time_series_interval == 0:
             N_total = int(np.sum((covered_count > 0) & passable_mask))
-            # 自适应阈值
-            avg_d = traj_len_so_far / max(idx, 1) if idx > 0 else 0.0
-            hp = max(1, int(np.ceil((2.0 * config.coverage_radius) / avg_d))) if avg_d > 1e-9 else 1
-            N_re = int(np.sum((covered_count > hp) & passable_mask))
-            rep = (N_re / N_total) if N_total > 0 else 0.0
+            unique_a = N_total * res2
+            strip_a = traj_len_so_far * strip_w
+            rep = max(0.0, (strip_a - unique_a) / strip_a) if strip_a > 1e-9 else 0.0
             series.append((t, N_total / total_passable, rep))
 
     if len(trajectory) > 0 and (len(trajectory) % config.time_series_interval != 0):
         t = trajectory[-1][0]
         N_total = int(np.sum((covered_count > 0) & passable_mask))
-        n = len(trajectory)
-        avg_d = traj_len_so_far / max(n - 1, 1) if n > 1 else 0.0
-        hp = max(1, int(np.ceil((2.0 * config.coverage_radius) / avg_d))) if avg_d > 1e-9 else 1
-        N_re = int(np.sum((covered_count > hp) & passable_mask))
-        rep = (N_re / N_total) if N_total > 0 else 0.0
+        unique_a = N_total * res2
+        strip_a = traj_len_so_far * strip_w
+        rep = max(0.0, (strip_a - unique_a) / strip_a) if strip_a > 1e-9 else 0.0
         series.append((t, N_total / total_passable, rep))
 
     return series
@@ -433,6 +446,60 @@ def compute_trajectory_length(trajectory: List[Tuple[float, float, float]],
         if d >= min_movement:
             total += d
     return total
+
+
+def resample_trajectory_spatial(
+        trajectory: List[Tuple[float, float, float]],
+        interval: float = 0.02) -> List[Tuple[float, float, float]]:
+    """空间重采样：将轨迹按固定空间间隔均匀重采样，消除采样频率影响。
+
+    原理（信号处理中的下采样/抗混叠）:
+        原始轨迹点的时间密度取决于帧率（1Hz vs 30Hz），导致轨迹长度差异显著。
+        按固定空间间隔重采样后，轨迹长度仅取决于实际运动路径，
+        与采样频率解耦，使条带面积法结果可跨实验对比。
+
+    Args:
+        trajectory: 原始轨迹 [(t, x, y), ...]
+        interval:   目标空间间隔 (m)
+
+    Returns:
+        重采样后的轨迹，保留原始时间戳
+    """
+    if len(trajectory) < 2 or interval <= 0:
+        return list(trajectory)
+
+    result: List[Tuple[float, float, float]] = [trajectory[0]]
+    accumulated_dist = 0.0
+
+    for i in range(1, len(trajectory)):
+        t_prev, x_prev, y_prev = trajectory[i - 1]
+        t_curr, x_curr, y_curr = trajectory[i]
+
+        seg_dx = x_curr - x_prev
+        seg_dy = y_curr - y_prev
+        seg_len = math.hypot(seg_dx, seg_dy)
+
+        if seg_len < 1e-9:
+            continue
+
+        # 沿线段插值，每隔 interval 采样一个点
+        remaining = seg_len + accumulated_dist
+        while remaining >= interval:
+            remaining -= interval
+            # 从当前线段起点出发，走过 (seg_len - remaining) 距离
+            t_interp = (seg_len - remaining) / seg_len
+            x_new = x_prev + seg_dx * t_interp
+            y_new = y_prev + seg_dy * t_interp
+            t_new = t_prev + (t_curr - t_prev) * t_interp
+            result.append((t_new, x_new, y_new))
+
+        accumulated_dist = remaining
+
+    # 确保终点被包含
+    if len(result) == 0 or result[-1] != trajectory[-1]:
+        result.append(trajectory[-1])
+
+    return result
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -648,16 +715,31 @@ class CameraCoverageAnalyzer:
 
         cap.release()
 
-        # 6. 计算覆盖
+        # 6. 计算覆盖（使用空间重采样后的轨迹）
         print("计算覆盖网格与指标...")
-        traj_len = compute_trajectory_length(self._trajectory, cfg.min_movement)
+        raw_len = compute_trajectory_length(self._trajectory, cfg.min_movement)
+        raw_pts = len(self._trajectory)
+
+        # 空间重采样：消除采样频率误差（1Hz vs 30Hz 轨迹长度差异）
+        if cfg.spatial_resample_interval > 0 and len(self._trajectory) > 1:
+            traj_resampled = resample_trajectory_spatial(
+                self._trajectory, cfg.spatial_resample_interval)
+            print(f"      空间重采样: {raw_pts} 点 → {len(traj_resampled)} 点 "
+                  f"(间隔={cfg.spatial_resample_interval}m)")
+        else:
+            traj_resampled = self._trajectory
+
+        # 重采样后每步都是 spatial_resample_interval，无需 min_movement 过滤
+        traj_len = compute_trajectory_length(traj_resampled, min_movement=0.0)
+        print(f"      轨迹长度: 原始={raw_len:.2f}m → 重采样后={traj_len:.2f}m")
+
         self._covered_count = accumulate_coverage(
-            self._trajectory, self._passable_mask, cfg)
+            traj_resampled, self._passable_mask, cfg)
         self._metrics = compute_metrics(
             self._covered_count, self._passable_mask, traj_len,
-            len(self._trajectory), cfg.coverage_radius, cfg.resolution)
+            cfg.strip_width, cfg.resolution)
         self._time_series = compute_time_series(
-            self._trajectory, self._passable_mask, cfg)
+            traj_resampled, self._passable_mask, cfg)
 
         # 7. 打印摘要
         self._print_summary()
@@ -840,12 +922,14 @@ class CameraCoverageAnalyzer:
 
     def _print_summary(self):
         m = self._metrics
-        hp = m.get("hits_per_pass", 0)
+        strip_a = m.get("strip_area_m2", 0.0)
+        unique_a = m.get("unique_area_m2", 0.0)
         print(f"\n{'='*55}")
-        print(f"  覆盖作业指标汇总 (阈值 h={hp} 次/格)")
+        print(f"  覆盖作业指标汇总 (条带面积法)")
         print(f"{'='*55}")
         print(f"  区域覆盖率:     {m['area_coverage']*100:6.2f} %")
         print(f"  重复覆盖率:     {m['repeat_coverage']*100:6.2f} %")
+        print(f"    (条带={strip_a:.4f}m², 唯一覆盖={unique_a:.4f}m²)")
         print(f"  覆盖效率:       {m['coverage_efficiency']:6.4f} m⁻¹")
         print(f"  轨迹总长度:     {m['trajectory_length_m']:6.2f} m")
         print(f"  可通行总面积:   {m['total_passable_cells']*self.config.resolution**2:6.3f} m²")
@@ -987,7 +1071,7 @@ class CameraCoverageAnalyzer:
 
         ax.plot(ts_list, area_list, 'g-', linewidth=1.5, label='Area Coverage')
         ax.plot(ts_list, repeat_list, 'orange', linewidth=1.5,
-                label='Repeat Coverage (grid-adaptive)')
+                label='Repeat Coverage (strip-area)')
         ax.set_xlabel("Time (s)")
         ax.set_ylabel("Coverage (%)")
         ax.set_title("Coverage vs Time")
