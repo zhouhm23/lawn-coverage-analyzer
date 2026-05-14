@@ -531,6 +531,12 @@ def live_coverage(config: CameraCoverageConfig,
         else:
             stamped_path = output_video
 
+        # 保存 mask（便于日后离线分析）
+        if mask_img is not None:
+            mask_out = os.path.join(dirname, f"mask_{basename}{ts}.png")
+            cv2.imwrite(mask_out, mask_img)
+            print(f"✓ 蒙版已保存: {mask_out}")
+
         # 保存临时测试结果
         _save_temp_results(recorder, elapsed, frame_idx, stamped_path)
 
