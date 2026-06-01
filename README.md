@@ -72,6 +72,9 @@ python run_camera_coverage.py --video demo.mp4 --mask mask.png --visualize
 
 # 导出论文插图（实物照 + 红色条带覆盖 + 绿色轨迹中心线）
 python run_camera_coverage.py --video camera_record05102100.mp4 --mask mask.png --export-overlay
+python run_camera_coverage.py --video camera_record05101600.mp4  --mask mask1600.png --export-overlay --spatial-interval 0.1
+python run_camera_coverage.py --video camera_record05111712.mp4  --mask mask.png --export-overlay --spatial-interval 0.1 --frame-skip 30 
+python run_camera_coverage.py --video camera_record05101600.mp4 --mask mask1600.png
 ```
 
 ### 4. 单张图片测试
@@ -236,4 +239,19 @@ python run_camera_coverage.py --video camera_record05111712.mp4 --mask mask2100.
   ⚠ ArUco 丢失率 12.9% > 5%，请检查视频质量！
 
   结果合理了
+```
+
+## 测试5（添加标准测试脚本和样例）
+测试脚本：test_coverage.py->全部通过
+根据参数扫描选择最优参数组合si=0.02，fs=5
+结果样例：
+```bash
+python run_camera_coverage.py --video camera_record05101600.mp4 --mask mask1600.png
+区域覆盖率:      79.88 %
+重复覆盖率:      31.53 %
+(条带=4.9343m², 唯一覆盖=3.3783m²)
+覆盖效率:       0.0275 m⁻¹
+轨迹总长度:      29.03 m
+可通行总面积:    4.229 m²
+有效/总帧:      1831/3191
 ```

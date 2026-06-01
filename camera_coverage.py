@@ -65,7 +65,7 @@ class CameraCoverageConfig:
     video_fps: float = 0.0
 
     # 处理帧间隔（每 N 帧处理一次）
-    frame_skip: int = 30          # 默认每秒处理一帧 (30fps → 1fps)
+    frame_skip: int = 5          # 默认每秒处理一帧 (5fps → 1fps)
 
     # 时间曲线采样间隔（帧数）
     time_series_interval: int = 30
