@@ -258,7 +258,7 @@ def test_noise_inflation():
 # 真实场景模拟 (TC10-TC12)
 # ═══════════════════════════════════════════════════════════
 
-V = 0.26                      # 名义车速 m/s
+V = 0.40                      # 名义车速 m/s
 SIGMA = 0.003                 # ArUco 噪声 σ (实测 ~0.8mm, 保守取 3mm)
 DROPOUT_RATE = 0.15           # 模拟 ArUco 丢失率 15%
 
@@ -400,11 +400,11 @@ def test_realistic_combined():
 # ═══════════════════════════════════════════════════════════
 
 def _generate_dense_ground_truth():
-    """生成密集真值轨迹 (模拟 30fps × 0.26m/s, ~8.7mm 间距) + 已知几何路径。"""
+    """生成密集真值轨迹 (模拟 30fps × 0.40m/s, ~8.7mm 间距) + 已知几何路径。"""
     # 5线往复，模拟约 60s 真实割草
     L, spacing, n_lines = 1.6, 0.15, 5
     x0, y0 = 0.1, 0.15
-    n_line = int(L / 0.0087) + 1  # ~8.7mm 间距, 相当于 30fps @ 0.26m/s
+    n_line = int(L / 0.0087) + 1  # ~8.7mm 间距, 相当于 30fps @ 0.40m/s
     pts = []
     for i in range(n_lines):
         y = y0 + i * spacing

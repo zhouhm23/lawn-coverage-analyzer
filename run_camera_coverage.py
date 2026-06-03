@@ -45,7 +45,7 @@ def main():
     parser.add_argument("--end-frame", type=int, default=-1,
                         help="结束帧 (默认: -1 = 到结尾)")
     parser.add_argument("--frame-skip", type=int, default=5,
-                        help="处理帧间隔 (默认: 5 ≈ 6fps@30fps视频，车速0.26m/s下安全)")
+                        help="处理帧间隔 (默认: 5 ≈ 6fps@30fps视频，车速0.40m/s下安全)")
     parser.add_argument("--calib-frames", type=int, default=3,
                         help="标定稳定帧数，越大越抗抖动 (默认: 3)")
     parser.add_argument("--coverage-radius", type=float, default=0.085,

@@ -87,7 +87,7 @@ class CameraCoverageConfig:
         取预期帧间距的 30%，不低于 1mm。
         """
         eff_fps = self.video_fps / max(self.frame_skip, 1) if self.video_fps > 0 else 1.0
-        expected_step = 0.26 / eff_fps   # 名义车速 0.26 m/s
+        expected_step = 0.40 / eff_fps   # 名义车速 0.40 m/s
         return max(expected_step * 0.3, 0.001)
 
     @property

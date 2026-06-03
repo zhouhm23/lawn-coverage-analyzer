@@ -67,7 +67,7 @@ python record_camera.py --live --color-lower 35,50,50 --color-upper 85,255,255
 ```bash
 python record_camera.py --record --output demo.mp4
 
-# 离线分析（默认每秒处理1帧，车速0.26m/s下安全；如需逐帧可用 --frame-skip 1）
+# 离线分析（默认每秒处理1帧，车速0.40m/s下安全；如需逐帧可用 --frame-skip 1）
 python run_camera_coverage.py --video demo.mp4 --mask mask.png --visualize
 
 # 导出论文插图（实物照 + 红色条带覆盖 + 绿色轨迹中心线）
@@ -156,7 +156,7 @@ python run_camera_coverage.py --video demo.mp4 --mask mask.png --spatial-interva
 覆盖率依靠每个点 12cm 半径圆形覆盖填充间隙。新增 `--interpolate` 可在丢失 ≤5 帧时续接。
 
 ### 5. 静止抖动过滤 (v1.2)
-ArUco 检测存在亚像素抖动，静止时轨迹长度会虚假增长。新增 `--min-movement` 阈值（默认 0.01m = 1cm），低于此值的移动不计入轨迹长度。参考车速 0.26m/s，每帧位移约 8.7mm。
+ArUco 检测存在亚像素抖动，静止时轨迹长度会虚假增长。新增 `--min-movement` 阈值（默认 0.01m = 1cm），低于此值的移动不计入轨迹长度。参考车速 0.40m/s，每帧位移约 8.7mm。
 ```bash
 # 调整阈值（如 ArUco 抖动较大可适当提高）
 python record_camera.py --live --mask mask.png --min-movement 0.015
@@ -255,3 +255,4 @@ python run_camera_coverage.py --video camera_record05101600.mp4 --mask mask1600.
 可通行总面积:    4.229 m²
 有效/总帧:      1831/3191
 ```
+为节约时间，车速改为0.4m/s
