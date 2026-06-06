@@ -21,9 +21,7 @@ Thumbs.db
 
 # Project outputs
 *.mp4
-coverage_results/
-*.csv
-*.png
+coverage_results_old/
 
 # Jupyter
 .ipynb_checkpoints/
