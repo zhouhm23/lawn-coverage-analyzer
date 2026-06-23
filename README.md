@@ -74,7 +74,7 @@ python run_camera_coverage.py --video demo.mp4 --mask mask.png --visualize
 python run_camera_coverage.py --video camera_record05102100.mp4 --mask mask.png --export-overlay
 python run_camera_coverage.py --video camera_record05101600.mp4  --mask mask1600.png --export-overlay --spatial-interval 0.1
 python run_camera_coverage.py --video camera_record05111712.mp4  --mask mask.png --export-overlay --spatial-interval 0.1 --frame-skip 30 
-python run_camera_coverage.py --video camera_record05101600.mp4 --mask mask1600.png
+python run_camera_coverage.py --video camera_record06232000.mp4 --mask mask_camera_record06232000.png --calib-frames 1 --export-overlay
 ```
 
 ### 4. 单张图片测试

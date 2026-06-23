@@ -757,9 +757,13 @@ class CameraCoverageAnalyzer:
         """
         cfg = self.config
 
-        # 快速路径：首帧就全检测到，且 calib_frames=1，直接出
-        if cfg.calib_frames <= 1:
-            return self._calibrate_homography_once(frame)
+        # 先尝试首帧快速路径
+        try:
+            if cfg.calib_frames <= 1:
+                return self._calibrate_homography_once(frame)
+        except RuntimeError:
+            # 首帧检测失败，继续扫描后续帧
+            print("      首帧未检测到全部 4 角，开始扫描后续帧...")
 
         # 扫描视频找角点
         if cap is None:

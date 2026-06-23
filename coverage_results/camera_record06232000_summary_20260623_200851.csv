@@ -1,0 +1,11 @@
+metric,value
+area_coverage,0.805501
+repeat_coverage,0.464542
+coverage_efficiency,0.021340
+total_passable_cells,170623.000000
+trajectory_length_m,37.745889
+unique_area_m2,3.435925
+strip_area_m2,6.416801
+lost_frames,1025
+total_frames,4190
+valid_trajectory_points,3165
